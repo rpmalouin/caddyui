@@ -1506,6 +1506,26 @@ func UpdateUserPassword(db *sql.DB, id int64, passwordHash string) error {
 	return err
 }
 
+// DeleteSessionsForUser drops the stored sessions belonging to one user.
+//
+// Review finding #11 (2026-10-04): changing or resetting a password left every
+// existing session valid for the remainder of its TTL, so the account-recovery
+// path (forgot-password) never evicted a session an attacker had already
+// stolen. Callers revoke on password reset, on invite acceptance, and when an
+// admin sets a user's password.
+//
+// keepToken is a HASHED session token (auth.HashSessionToken) to preserve, so a
+// user changing their own password stays signed in on the device they used
+// while every other session is dropped. Empty keepToken revokes all of them.
+func DeleteSessionsForUser(db *sql.DB, userID int64, keepToken string) error {
+	if strings.TrimSpace(keepToken) == "" {
+		_, err := db.Exec(`DELETE FROM sessions WHERE user_id = ?`, userID)
+		return err
+	}
+	_, err := db.Exec(`DELETE FROM sessions WHERE user_id = ? AND token <> ?`, userID, keepToken)
+	return err
+}
+
 func DeleteUser(db *sql.DB, id int64) error {
 	_, err := db.Exec(`DELETE FROM users WHERE id=?`, id)
 	return err

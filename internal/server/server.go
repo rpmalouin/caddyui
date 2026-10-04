@@ -24,6 +24,7 @@ import (
 	"net/smtp"
 	"net/url"
 	"os"
+	"path"
 	"slices"
 	"sort"
 	"strconv"
@@ -1038,12 +1039,20 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 			return
 		}
 		// Enforce 2FA policy if enabled.
-		if !u.TOTPEnabled {
+		if !u.TOTPEnabled && currentAPITokenScope(r) == "" {
 			if v, _ := models.GetSetting(s.DB, settingRequire2FA); v == "1" {
-				// Allow the TOTP setup pages and static assets through.
 				path := r.URL.Path
-				if !strings.HasPrefix(path, "/totp/") && !strings.HasPrefix(path, "/static/") &&
-					!strings.HasPrefix(path, "/api/") && path != "/logout" {
+				// Review finding #9 (2026-10-04): /api/ used to be exempt
+				// here, so a session user who never enrolled TOTP could keep
+				// driving every JSON endpoint — the policy was advisory in
+				// practice. Answer API callers with JSON 403 rather than a
+				// redirect (a 303 would hand HTML to a fetch/JSON client),
+				// and keep the enrolment page + static assets reachable.
+				if strings.HasPrefix(path, "/api/") {
+					writeJSONError(w, http.StatusForbidden, "two-factor authentication enrolment is required")
+					return
+				}
+				if !strings.HasPrefix(path, "/totp/") && !strings.HasPrefix(path, "/static/") && path != "/logout" {
 					http.Redirect(w, r, "/totp/setup?required=1", http.StatusSeeOther)
 					return
 				}
@@ -1052,10 +1061,16 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 		// TOTP enforcement: if the admin has enabled require_totp and this user
 		// has TOTP disabled, redirect them to TOTP setup before granting access.
 		// Skip the check for the TOTP setup page itself to avoid a redirect loop.
-		if mustGetSetting(s.DB, settingRequireTOTP) == "1" {
+		if mustGetSetting(s.DB, settingRequireTOTP) == "1" && currentAPITokenScope(r) == "" {
 			if !u.TOTPEnabled {
 				// Allow /totp/setup and /logout through so the user can complete enrollment.
 				path := r.URL.Path
+				if strings.HasPrefix(path, "/api/") {
+					// Same reasoning as the require_2fa gate above: JSON callers
+					// get a JSON refusal, not a redirect into an HTML page.
+					writeJSONError(w, http.StatusForbidden, "two-factor authentication enrolment is required")
+					return
+				}
 				if path != "/totp/setup" && path != "/logout" && !strings.HasPrefix(path, "/static/") {
 					http.Redirect(w, r, "/totp/setup?enforce=1", http.StatusFound)
 					return
@@ -1942,6 +1957,49 @@ func (s *Server) getLogin(w http.ResponseWriter, r *http.Request) {
 // on the forgot-password and invite handlers' log.Printf calls.
 func sanitizeForLog(s string) string {
 	return strings.NewReplacer("\n", "\\n", "\r", "\\r").Replace(s)
+}
+
+// safeLocalReferer returns the same-origin path of the request's Referer, or
+// fallback when there is no usable Referer.
+//
+// Review finding #10 (2026-10-04): several handlers redirected straight to
+// r.Header.Get("Referer"), which is attacker-influenced request input. Only
+// the PATH of the referrer is ever used (scheme and host are dropped), a
+// protocol-relative "//host" referrer is rejected outright, and the path is
+// path.Clean'd so a local-looking "/..//evil.example" cannot be handed to the
+// browser as a protocol-relative, off-origin target. Mirrors what redirectBack
+// in expectations.go already did for one handler. Implemented as
+// safeLocalReferer below.
+func safeLocalReferer(r *http.Request, fallback string) string {
+	if r == nil {
+		return fallback
+	}
+	raw := r.Referer()
+	// A protocol-relative referrer ("//evil.example/x") is never a local path.
+	if strings.HasPrefix(raw, "//") {
+		return fallback
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u == nil {
+		return fallback
+	}
+	p := u.Path
+	if !strings.HasPrefix(p, "/") {
+		return fallback
+	}
+	// A parsed path that itself begins "//" is protocol-relative too, even
+	// when it arrived inside an absolute URL ("http://host//evil.example/x").
+	if strings.HasPrefix(p, "//") {
+		return fallback
+	}
+	// Clean before returning: "/..//evil.example" is a local-looking string
+	// that a browser resolves to the protocol-relative "//evil.example", i.e.
+	// an off-origin redirect. Cleaning collapses ".." at the root.
+	p = path.Clean(p)
+	if !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") || strings.Contains(p, "..") {
+		return fallback
+	}
+	return p
 }
 
 // clientIPFromRequest extracts the real client IP, preferring forwarded
@@ -3215,10 +3273,7 @@ func (s *Server) reloadCaddy(w http.ResponseWriter, r *http.Request) {
 	//
 	// v2.27.0: the leftover HX-Trigger header is gone too — htmx is no
 	// longer loaded at all, so nothing was ever listening for it.
-	dest := r.Header.Get("Referer")
-	if dest == "" {
-		dest = "/"
-	}
+	dest := safeLocalReferer(r, "/")
 	http.Redirect(w, r, dest, http.StatusSeeOther)
 }
 
@@ -5834,6 +5889,10 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request) {
 			renderErr(err.Error())
 			return
 		}
+		// Review finding #11 (2026-10-04): an admin setting someone's password
+		// is usually a lockout/recovery action, so the target's existing
+		// sessions must not survive it.
+		_ = models.DeleteSessionsForUser(s.DB, id, "")
 	}
 	_ = models.LogActivity(s.DB, s.currentServerID(r), s.currentUserEmail(r), "user_update", u.Email, role, true)
 	http.Redirect(w, r, "/users", http.StatusSeeOther)
@@ -6461,6 +6520,10 @@ func (s *Server) postResetPassword(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to update password", http.StatusInternalServerError)
 		return
 	}
+	// Review finding #11 (2026-10-04): a reset is the recovery path for a
+	// possibly-compromised account, so every session minted under the old
+	// password must stop working.
+	_ = models.DeleteSessionsForUser(s.DB, userID, "")
 	// Consume the token.
 	_ = models.SetSetting(s.DB, "pw_reset_"+hash, "")
 	http.Redirect(w, r, "/login?reset=1", http.StatusSeeOther)
@@ -6570,6 +6633,10 @@ func (s *Server) postAcceptInvite(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "update password: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// Review finding #11 (2026-10-04): set a fresh password on a stub account
+	// with no live sessions of its own — revoke defensively in case an invite
+	// is re-accepted after the account was already in use.
+	_ = models.DeleteSessionsForUser(s.DB, userID, "")
 	_ = models.SetSetting(s.DB, "invite_"+hash, "")
 	http.Redirect(w, r, "/login?invited=1", http.StatusSeeOther)
 }
@@ -7026,6 +7093,16 @@ func (s *Server) postProfile(w http.ResponseWriter, r *http.Request) {
 			log.Printf("profile change_password: %v", err)
 			http.Redirect(w, r, "/profile?error=Failed+to+update+password", http.StatusFound)
 			return
+		}
+		// Review finding #11 (2026-10-04): drop every other session belonging
+		// to this user — a password change is how someone evicts a session
+		// they no longer trust — while keeping the current one signed in.
+		keepToken := ""
+		if c, cerr := r.Cookie(auth.SessionCookie); cerr == nil && c.Value != "" {
+			keepToken = auth.HashSessionToken(c.Value)
+		}
+		if serr := models.DeleteSessionsForUser(s.DB, cu.ID, keepToken); serr != nil {
+			log.Printf("profile change_password: revoke other sessions: %v", serr)
 		}
 		_ = models.LogActivity(s.DB, s.currentServerID(r), cu.Email, "profile_change_password", "", "", true)
 		http.Redirect(w, r, "/profile?flash=Password+changed+successfully", http.StatusFound)

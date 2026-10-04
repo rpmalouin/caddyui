@@ -310,10 +310,7 @@ func (s *Server) selectServer(w http.ResponseWriter, r *http.Request) {
 		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 	})
-	ref := r.Header.Get("Referer")
-	if ref == "" {
-		ref = "/"
-	}
+	ref := safeLocalReferer(r, "/")
 	http.Redirect(w, r, ref, http.StatusSeeOther)
 }
 

@@ -312,11 +312,7 @@ func (s *Server) toggleProxyHost(w http.ResponseWriter, r *http.Request) {
 	if err := s.syncCaddy(s.currentServerID(r), false); err != nil {
 		log.Printf("toggleProxyHost: auto-sync failed (toggle persisted but Caddy not updated): %v", err)
 	}
-	ref := r.Header.Get("Referer")
-	if ref == "" {
-		ref = "/proxy-hosts"
-	}
-	http.Redirect(w, r, ref, http.StatusSeeOther)
+	http.Redirect(w, r, safeLocalReferer(r, "/proxy-hosts"), http.StatusSeeOther)
 }
 
 // bulkToggleProxyHosts enables or disables a set of proxy hosts in one shot.
@@ -980,11 +976,7 @@ func (s *Server) toggleMaintenanceMode(w http.ResponseWriter, r *http.Request) {
 	if err := s.syncCaddy(ph.ServerID, false); err != nil {
 		log.Printf("toggleMaintenanceMode: syncCaddy: %v", err)
 	}
-	ref := r.Header.Get("Referer")
-	if ref == "" {
-		ref = "/proxy-hosts"
-	}
-	http.Redirect(w, r, ref, http.StatusSeeOther)
+	http.Redirect(w, r, safeLocalReferer(r, "/proxy-hosts"), http.StatusSeeOther)
 }
 
 // toggleRedirectionHost flips the enabled state on a redirection host and triggers a sync.
@@ -1010,11 +1002,7 @@ func (s *Server) toggleRedirectionHost(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = models.LogActivity(s.DB, s.currentServerID(r), s.currentUserEmail(r), action, fmt.Sprintf("redirect:%d", id), "", true)
 	s.trySyncCaddy(s.currentServerID(r), false)
-	ref := r.Header.Get("Referer")
-	if ref == "" {
-		ref = "/redirection-hosts"
-	}
-	http.Redirect(w, r, ref, http.StatusSeeOther)
+	http.Redirect(w, r, safeLocalReferer(r, "/redirection-hosts"), http.StatusSeeOther)
 }
 
 // parseBasicAuthUsers collects basicauth_user[], basicauth_pass[], and

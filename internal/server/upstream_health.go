@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -1270,6 +1271,39 @@ func isInternalHostname(host string) bool {
 	return true
 }
 
+// forbidLinkLocalTarget rejects probe targets that resolve to a link-local
+// address (169.254.0.0/16, fe80::/10).
+//
+// Review finding #12 (2026-10-04): the upstream tester connects to a
+// caller-supplied host:port, so without this a writer account could point it at
+// the cloud-metadata address (169.254.169.254) or sweep its own link-local
+// neighbourhood. The hostname is resolved once here; a name that rebinds to a
+// link-local address between this check and the probe would still slip through,
+// which is acceptable for a diagnostic an operator triggers by hand.
+func forbidLinkLocalTarget(host string) error {
+	linkLocal := func(ip net.IP) bool {
+		return ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if linkLocal(ip) {
+			return fmt.Errorf("refusing to probe the link-local address %s", host)
+		}
+		return nil
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		// Unresolvable from CaddyUI: let the probe itself report the DNS
+		// failure with its actionable hint rather than failing here.
+		return nil
+	}
+	for _, ip := range ips {
+		if linkLocal(ip) {
+			return fmt.Errorf("refusing to probe %s: it resolves to the link-local address %s", host, ip)
+		}
+	}
+	return nil
+}
+
 // isDNSError returns true when err is a DNS resolution failure (as opposed
 // to a connection refused / timeout / TLS error). DNS failure from the
 // caddyui container doesn't imply the backend is down — Caddy on a
@@ -1330,8 +1364,18 @@ func (s *Server) apiCaddyUpstreams(w http.ResponseWriter, r *http.Request) {
 // Accepts POST with form fields: host, port, scheme (http/https).
 // Returns JSON: {ok: bool, status: int, latency_ms: int, error: string}.
 func (s *Server) apiTestUpstream(w http.ResponseWriter, r *http.Request) {
-	if s.currentUser(r) == nil {
+	cu := s.currentUser(r)
+	if cu == nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	// Review finding #12 (2026-10-04): this endpoint was reachable by
+	// read-only accounts and makes an outbound HTTP request to a caller-chosen
+	// host:port — a port-scan / SSRF primitive handed to the lowest-privileged
+	// role. The pages that call it (the proxy-host form) already sit behind
+	// requireWrite, so demanding a writer here costs nothing.
+	if cu.Role == models.RoleView {
+		writeJSON(w, http.StatusForbidden, map[string]any{"ok": false, "error": "read-only account — ask an admin to test upstreams"})
 		return
 	}
 	// Accept both multipart/form-data (FormData from JS) and
@@ -1348,6 +1392,11 @@ func (s *Server) apiTestUpstream(w http.ResponseWriter, r *http.Request) {
 	}
 	if scheme != "https" {
 		scheme = "http"
+	}
+	if err := forbidLinkLocalTarget(host); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+		return
 	}
 	targetURL := fmt.Sprintf("%s://%s:%s/", scheme, host, port)
 	client := &http.Client{

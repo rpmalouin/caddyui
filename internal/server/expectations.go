@@ -362,12 +362,7 @@ func (s *Server) runProxyHostExpectationsHandler(w http.ResponseWriter, r *http.
 }
 
 func redirectBack(w http.ResponseWriter, r *http.Request) {
-	back := "/"
-	// Only a local path: "//evil.example" would be a protocol-relative URL.
-	if u, err := url.Parse(r.Referer()); err == nil && u != nil && strings.HasPrefix(u.Path, "/") && !strings.HasPrefix(u.Path, "//") {
-		back = u.Path
-	}
-	http.Redirect(w, r, back, http.StatusSeeOther)
+	http.Redirect(w, r, safeLocalReferer(r, "/"), http.StatusSeeOther)
 }
 
 // reapplySyncHandler: POST /servers/{id}/sync-reapply — clears the hold and
