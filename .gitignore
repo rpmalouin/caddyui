@@ -53,3 +53,8 @@ bin/
 
 # OpenClaw CLI shared images (not part of the project)
 .openclaw-cli-images/
+
+# Local-only fork exclusions: never commit these
+# MEMORY.md holds machine-local notes (absolute paths, toolchain location, review outcome)
+# for rpmalouin's fork and means nothing to anyone else.
+MEMORY.md

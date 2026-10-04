@@ -1,3 +1,11 @@
+> **This is Ron Malouin's personal fork of [X4Applegate/caddyui](https://github.com/X4Applegate/caddyui).**
+> Why it exists: Caddy is the reverse proxy on this homelab, and this copy carries a 2026-10-04
+> security review of the upstream checkout plus its remediation — four fixes (2FA gate coverage,
+> write-gating the upstream tester, `Referer`-based redirect validation, session revocation on
+> password change) with regression tests for each. No upstream pull requests are planned.
+> See [FORK.md](FORK.md) for the exact delta, the deliberately excluded files, and what is absent
+> here (notably GitHub Actions — the upstream gates are run by hand).
+
 # Caddy UI
 
 A modern, self-hosted web UI for [Caddy](https://caddyserver.com/) — manage proxy hosts, redirections, SSL certificates, and advanced routes through a clean interface, without touching config files.
