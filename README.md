@@ -4,7 +4,8 @@
 > write-gating the upstream tester, `Referer`-based redirect validation, session revocation on
 > password change) with regression tests for each. No upstream pull requests are planned.
 > See [FORK.md](FORK.md) for the exact delta, the deliberately excluded files, and what is absent
-> here (notably GitHub Actions — the upstream gates are run by hand).
+> here (notably GitHub Actions — the upstream gates are run by hand). If you want these changes,
+> fork it and support your fork — upstream is the place for upstream issues.
 
 # Caddy UI
 
