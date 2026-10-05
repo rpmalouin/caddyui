@@ -38,6 +38,13 @@ type Client struct {
 	AdminURL string
 	Username string
 	Password string
+	// HostHeader, when non-empty, is sent as the request's Host header instead
+	// of the one derived from AdminURL. Needed when the admin API is reached
+	// through a forwarding hop (e.g. a bridge gateway) because Caddy's admin
+	// endpoint enforces a host check: it only answers Host 127.0.0.1:2019 or
+	// localhost, so a request addressed to the gateway address is rejected with
+	// `403 host not allowed`. Set from CADDYUI_ADMIN_HOST_HEADER.
+	HostHeader string
 	// socketPath is populated when AdminURL has the unix:// scheme; the
 	// effective URL sent to the HTTP transport is rewritten to http://unix.
 	socketPath string
@@ -53,6 +60,10 @@ func New(adminURL, username, password string) *Client {
 		Username: username,
 		Password: password,
 	}
+	// Optional Host-header override — see the HostHeader field. Read here so
+	// every client (including the per-server ones built during a sync) picks it
+	// up without touching each construction site.
+	c.HostHeader = strings.TrimSpace(os.Getenv("CADDYUI_ADMIN_HOST_HEADER"))
 	// Detect unix:// scheme and wire a custom transport that dials the socket.
 	// The caller-facing AdminURL is replaced with http://unix so net/http will
 	// build a valid request; the transport's DialContext ignores the host.
@@ -76,6 +87,9 @@ func New(adminURL, username, password string) *Client {
 func (c *Client) applyAuth(req *http.Request) {
 	if c.Username != "" || c.Password != "" {
 		req.SetBasicAuth(c.Username, c.Password)
+	}
+	if c.HostHeader != "" {
+		req.Host = c.HostHeader
 	}
 }
 
