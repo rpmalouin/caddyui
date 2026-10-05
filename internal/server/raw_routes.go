@@ -228,6 +228,9 @@ func (s *Server) validateProposedConfig(serverID int64, proxies []models.ProxyHo
 	}
 	previewRoutes := append(s.buildMergedRoutes(proxies, redirs, raws), buildManagedCertificateRoutes(certs)...)
 	httpRoutes := s.buildHTTPRoutes(proxies, redirs, raws)
+	// Mirror syncCaddy's plain-HTTP ownership check so a preview validates the
+	// same document the real sync would push.
+	plainHTTPForeign := foreignPlainHTTPListener(httpServersMap(current))
 	// issue #100: mirror the global blocklist prepend so preview validation
 	// matches what sync would push.
 	if gb := caddy.BuildGlobalBlocklistRoute(mustGetSetting(s.DB, settingGlobalIPBlocklist)); gb != nil {
@@ -243,7 +246,7 @@ func (s *Server) validateProposedConfig(serverID int64, proxies []models.ProxyHo
 	applyCertLoaders(proposed, loadPEM, loadFiles)
 	applySkipCertificates(proposed, buildSkipCertificates(proxies, redirs, raws, certs))
 	removeUnsupportedSkipRedirects(proposed)
-	applyDisableAutomaticHTTPSRedirects(proposed, len(httpRoutes) > 0)
+	applyDisableAutomaticHTTPSRedirects(proposed, plainHTTPForeign || len(httpRoutes) > 0)
 	applySkipAccessLogs(proposed, buildSkipAccessLogs(proxies))
 	previewPolicies := s.buildDNSAutomationPolicies(proxies, redirs, raws, certs)
 	previewPolicies = append(previewPolicies, buildInternalTLSAutomationPolicies(proxies)...) // v2.46.0
@@ -975,6 +978,11 @@ func (s *Server) syncCaddyInner(serverID int64, forceTLS bool) error {
 		_ = models.LogActivity(s.DB, serverID, "system", "sync_fetch_failed", "", err.Error(), false)
 		return fmt.Errorf("fetch current config: %w", err)
 	}
+	// Does something that is not ours already serve plain HTTP? If so this sync
+	// must not create, write or delete caddyui_http (see
+	// foreignPlainHTTPListener) — the port belongs to the operator, typically a
+	// Caddyfile `http://host` site in front of a Cloudflare tunnel.
+	plainHTTPForeign := foreignPlainHTTPListener(httpServersMap(current))
 
 	proposed, err := deepCopyMap(current)
 	if err != nil {
@@ -988,7 +996,10 @@ func (s *Server) syncCaddyInner(serverID int64, forceTLS bool) error {
 	applyCertLoaders(proposed, loadPEM, loadFiles)
 	applySkipCertificates(proposed, skipList)
 	removeUnsupportedSkipRedirects(proposed)
-	applyDisableAutomaticHTTPSRedirects(proposed, len(httpRoutes) > 0)
+	// When another server owns :80 the generated redirects could never be added
+	// (Caddy would have to merge them into that server), so suppress them
+	// explicitly and leave the port alone.
+	applyDisableAutomaticHTTPSRedirects(proposed, plainHTTPForeign || len(httpRoutes) > 0)
 	applySkipAccessLogs(proposed, skipAccessLogs)
 	applyTLSConnectionPolicies(proposed, tlsConnPolicies)
 	applyAutomationPolicies(proposed, tlsAutomationPolicies)
@@ -1051,7 +1062,11 @@ func (s *Server) syncCaddyInner(serverID int64, forceTLS bool) error {
 	// When enabling CaddyUI's HTTP server, suppress Caddy's generated redirect
 	// listener first. When removing it, delete ours before restoring automatic
 	// redirects.
-	if len(httpRoutes) > 0 {
+	if plainHTTPForeign {
+		// Plain HTTP belongs to another server: that server and the automatic
+		// HTTPS subtree are both left untouched, so its listener and routes stay
+		// exactly as the operator declared them in the Caddyfile.
+	} else if len(httpRoutes) > 0 {
 		if err := s.writeAutomaticHTTPSSubtree(skipList, true, forceTLS); err != nil {
 			_ = models.LogActivity(s.DB, serverID, "system", "sync_apply_autohttps_failed", "", err.Error(), false)
 			return err

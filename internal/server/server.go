@@ -4961,6 +4961,57 @@ func applyRoutes(cfg map[string]any, routes []any) {
 	srv["routes"] = routes
 }
 
+// foreignPlainHTTPListener reports whether the config already has a plain-HTTP
+// listener that is not CaddyUI's own (caddyui_http). That is the normal shape
+// for a Caddyfile-declared `http://host` site — for example an origin served
+// through a Cloudflare tunnel — and Caddy permits only one server per listener,
+// so creating caddyui_http alongside it makes Caddy reject every proposal with
+// `listener address repeated: tcp/:80` and no route ever syncs. When this is
+// true the sync leaves that port entirely to its owner.
+func foreignPlainHTTPListener(servers map[string]any) bool {
+	for name, raw := range servers {
+		if name == "caddyui_http" {
+			continue
+		}
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		listen, _ := m["listen"].([]any)
+		for _, l := range listen {
+			s, _ := l.(string)
+			if plainHTTPPort(s) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// plainHTTPPort reports whether a Caddy listen address binds the plain-HTTP
+// port: ":80", "0.0.0.0:80", "[::]:80" and "host:80" all count. A scheme-bearing
+// form or any other port does not.
+func plainHTTPPort(addr string) bool {
+	addr = strings.TrimSpace(addr)
+	if addr == "" || strings.Contains(addr, "://") {
+		return false
+	}
+	i := strings.LastIndex(addr, ":")
+	if i < 0 {
+		return false
+	}
+	return strings.Trim(addr[i+1:], "[]") == "80"
+}
+
+// httpServersMap reads apps.http.servers without creating anything — ensureMap
+// would insert empty maps into a config that is only being inspected.
+func httpServersMap(cfg map[string]any) map[string]any {
+	apps, _ := cfg["apps"].(map[string]any)
+	httpApp, _ := apps["http"].(map[string]any)
+	servers, _ := httpApp["servers"].(map[string]any)
+	return servers
+}
+
 // applyPlainHTTPServer mirrors the Caddyfile adapter's representation of a
 // site declared with both http:// and https:// addresses: HTTPS stays on srv0,
 // while an explicit :80 server handles hosts whose Force SSL toggle is off.
@@ -4972,6 +5023,12 @@ func applyPlainHTTPServer(cfg map[string]any, routes []any) {
 	servers := ensureMap(httpApp, "servers")
 	if len(routes) == 0 {
 		delete(servers, "caddyui_http")
+		return
+	}
+	if foreignPlainHTTPListener(servers) {
+		// Someone else owns plain HTTP here; do not contest the listener. The
+		// routes that would have gone into caddyui_http are dropped from the
+		// proposal rather than written to a server we do not control.
 		return
 	}
 	servers["caddyui_http"] = map[string]any{
