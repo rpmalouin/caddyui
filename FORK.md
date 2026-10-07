@@ -47,6 +47,25 @@ internal/server/upstream_target_test.go   new — link-local refusal
 internal/models/session_revoke_test.go    new — session eviction semantics
 ```
 
+## Fork delta: the "unresolvable domain is not an outage" fix
+
+One behavioural fix, unrelated to the security review. It is here because the
+homelab's proxy hosts are almost all internally-named (`paperless-gpt.home`,
+`beets.home`, …) and the app reported every one of them as down.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Dashboard shows a critical "Upstreams are down — 54 enabled proxy host(s) have failing health checks" while every container is up and every site answers. | The 5-minute public health checker (`internal/server/upstream_health_notifier.go`, `checkProxyHost`) probes `https://<first-domain>/` by name and persists `ok=false` for *any* error, including a name-resolution failure. Inside the container `*.home` does not exist in DNS (`dial tcp: lookup <host>.home on 127.0.0.11:53: no such host`), so all 54 hosts were stored as failures and the dashboard's down count read straight from that table. The App-dot probe next to it (`app_health.go`) already refused to judge in exactly this case — DNS error or private-only resolution → "unknown", never "down" — so the two probes disagreed. | `checkProxyHost` now applies the same rule: a DNS-resolution failure records no verdict and no row, and the rows that case already wrote are removed (`models.DeleteResolutionFailureProxyHealth`). A resolving-but-refused / TLS / timeout probe is still a recorded failure; only "this container cannot resolve the name" is withheld. An unresolvable host now shows as grey "unknown" rather than red "down". |
+
+```
+internal/server/upstream_health_notifier.go  resolution failure -> no verdict, plus a per-cycle count log
+internal/models/models.go                    DeleteResolutionFailureProxyHealth
+internal/server/public_health_resolution_test.go  new — no-verdict, real-failure, and row-set invariants
+```
+
+The same gap exists in upstream (`X4Applegate/caddyui`) — its `checkProxyHost`
+has no DNS branch either — but this fork carries local work only.
+
 ## What is absent in this fork
 
 - **GitHub Actions — absent on purpose.** `.github/workflows/*` (CI, CodeQL, Claude review, release

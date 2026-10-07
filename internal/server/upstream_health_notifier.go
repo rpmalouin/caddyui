@@ -101,6 +101,7 @@ func (s *Server) checkAllProxyHosts() {
 			log.Printf("health checker: list hosts for server %d: %v", srv.ID, err)
 			continue
 		}
+		unresolved := 0
 		for _, h := range hosts {
 			if !h.Enabled {
 				continue
@@ -124,7 +125,12 @@ func (s *Server) checkAllProxyHosts() {
 				continue
 			}
 			targetURL := scheme + "://" + domain + path
-			s.checkProxyHost(h.ID, targetURL, method, expectStatus, timeout)
+			if !s.checkProxyHost(h.ID, targetURL, method, expectStatus, timeout) {
+				unresolved++
+			}
+		}
+		if unresolved > 0 {
+			log.Printf("health checker: server %d: %d host(s) left unjudged — their domain does not resolve from this container", srv.ID, unresolved)
 		}
 	}
 }
@@ -164,7 +170,12 @@ func (s *Server) publicHealthDue(hostID int64, interval time.Duration) bool {
 	return time.Since(history[0].CheckedAt) >= interval-(publicHealthCheckerInterval/2)
 }
 
-func (s *Server) checkProxyHost(hostID int64, targetURL, method string, expectStatus int, timeout time.Duration) {
+// checkProxyHost probes one proxy host's public URL and persists the outcome
+// as a proxy_health row. The returned bool reports whether a verdict was
+// recorded at all: false means the domain did not resolve, so no row is
+// written and the host stays "unknown" instead of being reported down (see
+// the resolution-failure branch below).
+func (s *Server) checkProxyHost(hostID int64, targetURL, method string, expectStatus int, timeout time.Duration) bool {
 	client := &http.Client{
 		Timeout: timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -177,18 +188,39 @@ func (s *Server) checkProxyHost(hostID int64, targetURL, method string, expectSt
 	req, err := http.NewRequest(method, targetURL, nil)
 	if err != nil {
 		_ = models.InsertProxyHealth(s.DB, hostID, false, 0, 0, err.Error())
-		return
+		return true
 	}
 	start := time.Now()
 	resp, err := client.Do(req)
 	latencyMs := time.Since(start).Milliseconds()
 	if err != nil {
+		// A name-resolution failure says nothing about the host's
+		// availability: it says this container's resolver has no answer for
+		// the domain — a `.home`-style internal name, or split-horizon DNS
+		// that exists only on the operator's own clients — while the vhost
+		// is very likely serving every request through the front door.
+		// Recording it as ok=0 is what turned each internally-named host into
+		// a red "Upstreams are down" dashboard recommendation (54 hosts on
+		// this homelab, every one of them "no such host" with nothing
+		// actually failing, while Docker/Dockhand showed every container up).
+		// The App dot already refuses to judge in exactly this case
+		// (app_health.go: DNS error or private-only resolution → "unknown").
+		// Same rule here: write no verdict, and drop the rows this case
+		// produced earlier so the dashboard counts recover on their own.
+		if isDNSError(err) || isNetDNSError(err) {
+			if n, delErr := models.DeleteResolutionFailureProxyHealth(s.DB, hostID); delErr != nil {
+				log.Printf("health checker: host %d: drop resolution-failure rows: %v", hostID, delErr)
+			} else if n > 0 {
+				log.Printf("health checker: host %d: dropped %d resolution-failure row(s); domain does not resolve from this container", hostID, n)
+			}
+			return false
+		}
 		errMsg := err.Error()
 		if len(errMsg) > 200 {
 			errMsg = errMsg[:200]
 		}
 		_ = models.InsertProxyHealth(s.DB, hostID, false, 0, latencyMs, errMsg)
-		return
+		return true
 	}
 	defer resp.Body.Close()
 	// Drain body to free connection.
@@ -204,6 +236,7 @@ func (s *Server) checkProxyHost(hostID int64, targetURL, method string, expectSt
 		ok = resp.StatusCode < 400 || resp.StatusCode == 401 || resp.StatusCode == 403
 	}
 	_ = models.InsertProxyHealth(s.DB, hostID, ok, resp.StatusCode, latencyMs, "")
+	return true
 }
 
 // StartUpstreamNotifier launches a goroutine that checks upstream health every 5 minutes.

@@ -4910,6 +4910,37 @@ func InsertProxyHealth(db *sql.DB, hostID int64, ok bool, statusCode int, latenc
 	return err
 }
 
+// DeleteResolutionFailureProxyHealth removes a proxy host's persisted health
+// rows whose failure was the probe's own name resolution rather than the
+// host's availability (e.g. `dial tcp: lookup app.home on 127.0.0.11:53: no
+// such host`). Those rows are not evidence of an outage — the front door may
+// be serving the vhost perfectly — so the public health checker no longer
+// writes new ones; this clears the ones an earlier build left behind, which
+// is what keeps them out of the dashboard's down count and out of the
+// per-host history graph. Returns the number of rows removed.
+//
+// The SQL markers must stay in step with isDNSError()/isNetDNSError() in
+// internal/server: both describe the same set of resolution failures, one as
+// Go errors and one as stored text (the message is the only thing the table
+// records). TestResolutionFailureRowSetMatchesGoPredicate pins that.
+func DeleteResolutionFailureProxyHealth(db *sql.DB, hostID int64) (int64, error) {
+	res, err := db.Exec(`
+		DELETE FROM proxy_health
+		WHERE proxy_host_id = ?
+		  AND (error_msg LIKE '%no such host%'
+		       OR error_msg LIKE '%server misbehaving%'
+		       OR error_msg LIKE '%Temporary failure in name resolution%'
+		       OR error_msg LIKE '%dial tcp: lookup %')`, hostID)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // GetProxyHealthHistory returns the last N health checks for a given proxy host,
 // ordered newest first.
 func GetProxyHealthHistory(db *sql.DB, hostID int64, limit int) ([]ProxyHealthCheck, error) {
