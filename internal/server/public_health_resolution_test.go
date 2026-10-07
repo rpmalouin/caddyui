@@ -81,9 +81,10 @@ func TestCheckAllProxyHostsStillRecordsRealFailures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	host.ID = id
 
-	if recorded := s.checkProxyHost(id, "http://"+target+"/", "GET", 0, publicHealthCheckerTimeout); !recorded {
-		t.Error("checkProxyHost reported no verdict for a connection-refused probe, want a recorded failure")
+	if recorded := s.checkProxyHost(*host, target, "http://"+target+"/", "GET", 0, publicHealthCheckerTimeout, nil); recorded != probeJudged {
+		t.Errorf("checkProxyHost reported %v for a connection-refused probe, want a recorded failure", recorded)
 	}
 
 	history, err := models.GetProxyHealthHistory(s.DB, id, 1)

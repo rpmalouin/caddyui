@@ -140,11 +140,17 @@ func (s *Server) pollAllApps(ctx context.Context) {
 //	ok       — 2xx / 3xx / 401 / 403 (app responded with something sensible)
 //	degraded — 5xx or slow (>appHealthProbeTO)
 //	down     — connection refused / TLS error / timeout
-//	unknown  — domain doesn't resolve publicly (WG/Tailscale-only edge),
-//	           resolves only to private/RFC1918 IPs (split-horizon DNS,
-//	           /etc/hosts override, Docker embedded DNS — caddyui's view
-//	           of the world isn't the public internet's view, so refusing
-//	           to judge is the right call), or wildcard domain.
+//	unknown  — domain doesn't resolve publicly (WG/Tailscale-only edge) AND the
+//	           front door could not answer for it either, or it resolves only
+//	           to private/RFC1918 IPs (split-horizon DNS, /etc/hosts override,
+//	           Docker embedded DNS — caddyui's view of the world isn't the
+//	           public internet's view, so refusing to judge is the right call),
+//	           or it is a wildcard domain.
+//
+// A name this container cannot resolve is not the end of the probe: the front
+// door is asked by address with the vhost name in Host and SNI (see
+// frontdoor_probe.go), which is how the `.home` hosts get a real verdict
+// instead of a grey dot.
 //
 // Redirects are followed up to appHealthMaxRedirect hops so "/ → /login"
 // ends up as ok (200) rather than showing the 302. Cert validation is
@@ -237,12 +243,7 @@ func (s *Server) probeApp(ctx context.Context, h models.ProxyHost) appHealthEntr
 			// Be polite: reuse one connection per host, don't hold it open.
 			DisableKeepAlives: true,
 		},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= appHealthMaxRedirect {
-				return http.ErrUseLastResponse
-			}
-			return nil
-		},
+		CheckRedirect: appProbeRedirectPolicy(),
 	}
 
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
@@ -257,10 +258,19 @@ func (s *Server) probeApp(ctx context.Context, h models.ProxyHost) appHealthEntr
 	resp, err := client.Do(req)
 	latency := time.Since(start).Milliseconds()
 	if err != nil {
-		// DNS resolution failure → unknown, not down: the caddyui container
-		// may legitimately not resolve an edge-only domain even though the
-		// wider internet does.
+		// DNS resolution failure → ask the front door by address before
+		// giving up: the caddyui container may legitimately not resolve an
+		// internal name (`.home`) that the front door serves perfectly well.
+		// Only if that also fails is the honest answer "unknown", not "down".
 		if isDNSError(err) || isNetDNSError(err) {
+			if fdResp, fdLatency, ok := s.probeVhostFrontDoor(probeCtx, h, primary, scheme, probePath, probeMethod, probeTimeout); ok {
+				defer fdResp.Body.Close()
+				status, errMsg := classifyAppCode(fdResp.StatusCode, expectStatus)
+				return appHealthEntry{
+					Status: status, Code: fdResp.StatusCode, Error: errMsg,
+					LatencyMS: fdLatency, CheckedAt: now,
+				}
+			}
 			return appHealthEntry{Status: "unknown", Error: err.Error(), LatencyMS: latency, CheckedAt: now}
 		}
 		// If the dial failed against a private IP, the preflight check
@@ -282,34 +292,75 @@ func (s *Server) probeApp(ctx context.Context, h models.ProxyHost) appHealthEntr
 	defer resp.Body.Close()
 
 	code := resp.StatusCode
-	entry := appHealthEntry{Code: code, LatencyMS: latency, CheckedAt: now}
-	// v2.28.0 (issue #39): when the host declares an exact expected status,
-	// that verdict replaces the heuristic below entirely. This is what makes
-	// deliberately-unusual endpoints reportable — a health path that answers
-	// 204, or an app that correctly returns 418 on its probe route, is "ok"
-	// only if the operator said so, and anything else is unambiguously down.
+	status, errMsg := classifyAppCode(code, expectStatus)
+	return appHealthEntry{Status: status, Code: code, Error: errMsg, LatencyMS: latency, CheckedAt: now}
+}
+
+// appProbeRedirectPolicy follows redirects up to appHealthMaxRedirect so
+// "/ → /login" ends up classified on the page it lands on, then stops.
+func appProbeRedirectPolicy() func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) >= appHealthMaxRedirect {
+			return http.ErrUseLastResponse
+		}
+		return nil
+	}
+}
+
+// classifyAppCode maps an HTTP status to the App dot's verdict, honouring an
+// operator-declared expected status. Shared by the direct probe and the
+// front-door fallback so the two can never disagree about a status code:
+//
+//	ok       — 2xx / 3xx / 401 / 403 (the app answered with something sensible)
+//	degraded — 5xx, or a 4xx other than 401/403
+//
+// v2.28.0 (issue #39): when expectStatus is set it replaces the heuristic
+// entirely — that is what makes a deliberately-unusual endpoint reportable.
+func classifyAppCode(code, expectStatus int) (status, errMsg string) {
 	if expectStatus > 0 {
 		if code == expectStatus {
-			entry.Status = "ok"
-		} else {
-			entry.Status = "down"
-			entry.Error = fmt.Sprintf("HTTP %d (expected %d)", code, expectStatus)
+			return "ok", ""
 		}
-		return entry
+		return "down", fmt.Sprintf("HTTP %d (expected %d)", code, expectStatus)
 	}
 	switch {
 	case code >= 500:
-		entry.Status = "degraded"
-		entry.Error = fmt.Sprintf("HTTP %d", code)
+		return "degraded", fmt.Sprintf("HTTP %d", code)
 	case code >= 200 && code < 400, code == http.StatusUnauthorized, code == http.StatusForbidden:
-		entry.Status = "ok"
+		return "ok", ""
 	default:
 		// 4xx other than 401/403 — treat as degraded so the user notices;
 		// 404 on "/" often means the app is misconfigured.
-		entry.Status = "degraded"
-		entry.Error = fmt.Sprintf("HTTP %d", code)
+		return "degraded", fmt.Sprintf("HTTP %d", code)
 	}
-	return entry
+}
+
+// probeVhostFrontDoor re-issues one App-dot probe against the front door by
+// address, carrying the vhost's name in Host and SNI (see frontdoor_probe.go).
+// It answers only for hosts whose own URL the container could not resolve, and
+// only over https, because that is the listener the vhosts live on. The caller
+// owns closing the returned response; ok=false means the front door did not
+// answer either, which leaves the caller to record "unknown".
+func (s *Server) probeVhostFrontDoor(ctx context.Context, h models.ProxyHost, domain, scheme, probePath, method string, timeout time.Duration) (*http.Response, int64, bool) {
+	if scheme != "https" {
+		return nil, 0, false
+	}
+	for _, addr := range s.frontDoorAddrs(h.ServerID) {
+		u := (&url.URL{Scheme: "https", Host: addr, Path: probePath}).String()
+		req, err := http.NewRequestWithContext(ctx, method, u, nil)
+		if err != nil {
+			return nil, 0, false
+		}
+		req.Header.Set("User-Agent", "caddyui-app-health/1.0")
+		start := time.Now()
+		resp, err := frontDoorClient(domain, timeout, appProbeRedirectPolicy()).Do(frontDoorRequest(req, addr, domain))
+		latency := time.Since(start).Milliseconds()
+		if err != nil {
+			continue
+		}
+		return resp, latency, true
+	}
+	return nil, 0, false
 }
 
 // isNetDNSError catches net.DNSError values that the simpler string-match
