@@ -69,6 +69,10 @@ run CaddyUI directly in an LXC, VM, or bare-metal host.
 |-----------------|--------------------------|
 | ![New User](docs/screenshots/new-user.png) | ![Settings](docs/screenshots/settings.png) |
 
+| Caddyfile *(fork)* | Caddyfile editor *(fork)* |
+|--------------------|---------------------------|
+| ![Caddyfile](docs/screenshots/caddyfile.png) | ![Caddyfile editor](docs/screenshots/caddyfile-editor.png) |
+
 ---
 
 ## Features
@@ -91,6 +95,8 @@ checks a sha256 of the file it rendered from, snapshots the current file, writes
 Caddy's bind is pinned to does not move, reloads through the admin API, re-syncs so the rows are the
 last writer, and reinstalls the app's own access/certificate loggers, which a Caddyfile `/load`
 otherwise wipes.
+
+![Caddyfile editor](docs/screenshots/caddyfile-editor.png)
 
 Two deployment requirements follow from that: mount the Caddyfile writable, and make it writable by the
 container's UID (`10001`) — a `root:root 0644` file fails every save. `CADDYUI_CADDYFILE_SNAPSHOT_DIR`
