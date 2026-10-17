@@ -10,6 +10,8 @@ Upstream issues and fixes belong upstream; this copy carries local work only.
 - Upstream: `X4Applegate/caddyui`, branch `main`
 - Fork point: `f0f4b64` — "fix(scripts): publish description via a pipe"
 - Fork delta published: 2026-10-04
+- Last catch-up merge: `c43126a` (upstream v2.65.1-2), 2026-10-17 — 36 upstream commits
+  absorbed, two review fixes dropped because upstream fixed them independently
 
 ## Why this fork exists
 
@@ -23,28 +25,27 @@ posture → live-deployment checks). Its report lives outside this repo, on the 
 
 ## Fork delta: the security patch set
 
-Four findings were fixed, each with a regression test. Nothing else about the app was altered.
+Two of the four findings are still fork-only. **F2 and F4 were fixed upstream while this fork sat
+still, and were dropped at the v2.65.1 catch-up merge** rather than carried as a second, weaker copy
+— the rows below say what upstream now does instead.
 
 | Finding | What was wrong | Fix |
 |---|---|---|
-| F1 2FA gate coverage (Medium) | `require_2fa` exempted every `/api/*` path (`internal/server/server.go`), so a session user who never enrolled TOTP kept full use of the JSON API — including write endpoints. `require_totp` had no such exemption, so the two settings disagreed. | `/api/*` callers now get a JSON `403`; `/totp/`, `/static/`, `/logout` stay reachable so enrolment is possible; bearer-token requests are exempt from both gates. |
-| F2 Upstream tester reachable by readers (Medium) | `POST /api/proxy-hosts/test-upstream` was registered outside the `requireWrite` group, and the handler only checked "is there a session" — any viewer could make the app issue an HTTP GET to an arbitrary `host:port` with TLS verification disabled (port scan / cloud-metadata probe from inside the container network). | Writer-only (`view` role → JSON `403`), plus `forbidLinkLocalTarget()` refusing targets that resolve into link-local space (`169.254.169.254`, `fe80::/10`). |
-| F3 Unvalidated `Referer` as redirect target (Low) | Five handlers redirected to `r.Header.Get("Referer")` verbatim. One shape is worse than it looks: `/..//evil.example` is local-looking but a browser normalises it to the protocol-relative `//evil.example`. | One shared `safeLocalReferer(r, fallback)`: only the referrer's path is used, `//host` is rejected, and the path is `path.Clean`ed and re-checked. `expectations.go` already did this for one handler and now shares the helper. |
-| F4 Password change did not revoke sessions (Medium) | `models.UpdateUserPassword` only rewrote the hash; sessions live 7 days by default, so the account-recovery path left stolen sessions alive. | New `models.DeleteSessionsForUser(db, userID, keepToken)`, called on password reset, invite acceptance, admin-set password, and from the profile page with the caller's own session preserved. |
+| F1 2FA gate coverage (Medium) | `require_2fa` exempted every `/api/*` path (`internal/server/server.go`), so a session user who never enrolled TOTP kept full use of the JSON API — including write endpoints. **Still true upstream at v2.65.1**, which excludes `/api/` on purpose ("a JSON caller has no use for a redirect to an HTML page") — the exclusion is the hole, not the redirect it avoids. | `/api/*` callers now get a JSON `403`; `/totp/`, `/static/`, `/logout` stay reachable so enrolment is possible; bearer-token requests never reach the gate at all (they return earlier in `requireAuth`). Re-applied on top of upstream's v2.64.1 single-check rewrite of the same block. |
+| F2 Upstream tester reachable by readers (Medium) | `POST /api/proxy-hosts/test-upstream` was registered outside the `requireWrite` group, and the handler only checked "is there a session" — any viewer could make the app issue an HTTP GET to an arbitrary `host:port` with TLS verification disabled (port scan / cloud-metadata probe from inside the container network). | **Fixed upstream (v2.57.1) — fork patch dropped 2026-10-17.** The route is inside `requireWrite`, and for non-admins the handler refuses non-plain host/port and runs `dialBlockedForTenant` (loopback, link-local, cloud metadata, and the Caddy admin API). Stronger than this fork's `forbidLinkLocalTarget`, which only refused link-local. |
+| F3 Unvalidated `Referer` as redirect target (Low) | Five handlers redirected to `r.Header.Get("Referer")` verbatim. One shape is worse than it looks: `/..//evil.example` is local-looking but a browser normalises it to the protocol-relative `//evil.example`. **Still true upstream at v2.65.1** — five raw reads remain (`proxy_hosts.go` ×3, `caddy_servers.go`, `server.go`). | One shared `safeLocalReferer(r, fallback)`: only the referrer's path is used, `//host` is rejected, and the path is `path.Clean`ed and re-checked. `expectations.go` already did this for one handler and now shares the helper. |
+| F4 Password change did not revoke sessions (Medium) | `models.UpdateUserPassword` only rewrote the hash; sessions live 7 days by default, so the account-recovery path left stolen sessions alive. | **Fixed upstream (v2.57.1) — fork patch dropped 2026-10-17.** `UpdateUserPassword` now deletes every session of the user, and the profile page keeps the caller's own via `auth.DeleteOtherSessions`. Covers all four sites this fork had patched (reset, invite acceptance, admin-set password, profile). |
 
-Files touched by the patch set:
+Files touched by the remaining patch set:
 
 ```
-internal/models/models.go          DeleteSessionsForUser + password-change docs
-internal/server/server.go          2FA gate, safeLocalReferer, session revocation
+internal/models/models.go          (nothing left — F4's helper is gone)
+internal/server/server.go          2FA gate: /api/ gets a JSON 403, safeLocalReferer
 internal/server/proxy_hosts.go     3 Referer redirects -> safeLocalReferer
 internal/server/caddy_servers.go   Referer redirect -> safeLocalReferer
 internal/server/expectations.go    redirectBack folded into the shared helper
-internal/server/upstream_health.go forbidLinkLocalTarget + writer-only guard
-internal/server/twofa_gate_test.go        new — gate across pages/API/bearer/enrolment
-internal/server/referer_test.go           new — referrer sanitiser table + invariant
-internal/server/upstream_target_test.go   new — link-local refusal
-internal/models/session_revoke_test.go    new — session eviction semantics
+internal/server/twofa_gate_test.go        fork — gate across pages/API/bearer/enrolment
+internal/server/referer_test.go           fork — referrer sanitiser table + invariant
 ```
 
 ## Fork delta: hosts whose own name this deployment cannot resolve (the `.home` case)
@@ -111,24 +112,54 @@ has no DNS branch either — but this fork carries local work only.
 | SAST | `gosec -fmt=json ./...` | 162 findings before and after the patch set, identical per-rule counts |
 
 The toolchain is not the one on this host (`/usr/bin/go` is Go 1.18, below this module's
-`go 1.26.0` / `toolchain go1.26.6`). The gates above were run with Go 1.26.8 installed at
-`/opt/go-toolchains/go1.26.8`.
+`go 1.26.0` / `toolchain go1.27.2`). The gates above were run with Go 1.27.2 installed at
+`/opt/go-toolchains/go1.27.2` — the 1.26.8 that ran the original review no longer satisfies the
+module's toolchain line, and upstream moved to 1.27.2 to close 12 standard-library vulnerabilities.
 
-Not done: the app was never started — no login, TOTP or API flow has been exercised end to end.
-The patch set is verified by build, vet and unit tests only.
+Re-run of the same gates on the merged tree (2026-10-17, after the v2.65.1 catch-up): `gofmt` empty,
+`go build ./...` clean, `go vet ./...` clean, `go test ./...` green — every package `ok`
+(`internal/server` 130s), no failures.
+
+Not done by the review: an end-to-end login/TOTP/API walk-through — the patch set was verified by
+build, vet and unit tests. The app has since been deployed for real (it drives this homelab's
+production Caddy), so the flows are exercised in daily use; the fork's own machine notes keep the
+deployment specifics.
 
 ## Keeping up with upstream
 
 `origin` is upstream, `fork` is this repo, so:
 
 ```sh
-git fetch origin
-git merge origin/main      # or: git rebase origin/main
+git fetch origin --tags
+git branch -f backup-pre-catchup main      # rollback point
+git checkout -b upstream-catchup main
+git merge origin/main                      # a merge, not a rebase: this branch is published
+#   run the gates with /opt/go-toolchains/go1.27.2 (PATH + GOTOOLCHAIN=local)
+git checkout main && git merge --ff-only upstream-catchup
 git push fork main
 ```
 
-If upstream ever changes a file this fork also touches, the merge conflict will be in the six files
-listed above and nowhere else.
+Merge rather than rebase — `main` is published to `fork`, so a rebase rewrites history other clones
+have seen. Expect conflicts in the same three files upstream keeps rewriting underneath the fork's
+patches: `internal/server/server.go` (2FA gate, redirects), `internal/server/upstream_health.go`
+(test-upstream guard) and `internal/caddy/client.go` (admin client).
+
+**Re-check the delta before resolving anything, and drop what upstream has fixed.** At the
+2026-10-17 catch-up two of the four review fixes were already upstream under different shapes
+(F2 as `requireWrite` + `dialBlockedForTenant`, F4 as a session-deleting `UpdateUserPassword`).
+Carrying a second copy would have meant weaker duplicate guards and a bigger conflict surface next
+time. The test for each fix is on the upstream tip, not in this file:
+
+```sh
+git show origin/main:internal/server/server.go | grep -n 'HasPrefix(path, "/api/")'   # F1 still open?
+git show origin/main:internal/server/upstream_health.go | grep -n dialBlockedForTenant  # F2 fixed?
+git show origin/main:internal/server/proxy_hosts.go | grep -n 'Header.Get("Referer")'   # F3 still open?
+git show origin/main:internal/models/models.go | grep -n 'func UpdateUserPassword' -A 8 # F4 fixed?
+```
+
+Also: the merge brings back any workflow file upstream added after the fork point (it did on
+2026-10-17 — `dockerhub-description.yml`, `release-docker.yml`). Delete them again before pushing;
+the fork ships with no automation.
 
 ## Support
 
