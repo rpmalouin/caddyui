@@ -262,7 +262,7 @@ func TestCaddyfileViewServesFileAndNeverWritesConfig(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"paperless.home", "Drift — this file vs. live", "CRLF", "Validate (adapt only)"} {
+	for _, want := range []string{"paperless.home", "Drift — this file vs. live", "CRLF", "Validate only (runs nothing)"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("page is missing %q", want)
 		}
@@ -294,7 +294,7 @@ func TestCaddyfileValidateAdaptsTheBufferOnly(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "Showing the validated buffer") {
+	if !strings.Contains(body, "Showing the submitted buffer") {
 		t.Fatalf("the page does not mark the buffer as the validated text")
 	}
 	assertNoConfigWrite(t, paths())

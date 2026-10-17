@@ -191,18 +191,60 @@
 </div>
 {{end}}
 
-<h2 class="text-sm font-semibold uppercase tracking-wider text-ink-600 mb-2">Validate a change</h2>
-<form method="post" action="/caddyfile/validate" class="bg-white border border-ink-200 rounded-xl shadow-card p-5 max-w-5xl mb-8 space-y-3">
+<h2 class="text-sm font-semibold uppercase tracking-wider text-ink-600 mb-2">Edit and save</h2>
+
+{{if .SaveOK}}
+<div class="bg-emerald-50 border border-emerald-200 rounded-xl px-5 py-3 mb-4 max-w-5xl">
+  <div class="font-medium text-sm text-emerald-900">Saved</div>
+  <div class="text-xs mt-1 text-emerald-800">{{.SaveOK}}</div>
+  {{if .Allowed}}
+  <ul class="text-xs mt-2 text-emerald-800 list-disc list-inside space-y-0.5">
+    {{range .Allowed}}<li>{{.}}</li>{{end}}
+  </ul>
+  {{else}}
+  <div class="text-xs mt-2 text-emerald-800">No :80/snippet/global change was detected — the reload re-applied the same file.</div>
+  {{end}}
+</div>
+{{end}}
+
+{{if .SaveErr}}
+<div class="bg-red-50 border border-red-200 rounded-xl px-5 py-3 mb-4 max-w-5xl">
+  <div class="font-medium text-sm text-red-800">Not saved</div>
+  <div class="text-xs mt-1 text-red-700">{{.SaveErr}}</div>
+  {{if .Forbidden}}
+  <ul class="text-xs mt-2 text-red-700 font-mono list-disc list-inside space-y-0.5">
+    {{range .Forbidden}}<li>{{.}}</li>{{end}}
+  </ul>
+  {{end}}
+</div>
+{{end}}
+
+<form method="post" action="/caddyfile/save" class="bg-white border border-ink-200 rounded-xl shadow-card p-5 max-w-5xl mb-8 space-y-3">
   <p class="text-xs text-ink-500">
-    Edit the text and press Validate. It is sent to Caddy's <code class="font-mono">/adapt</code> only —
-    no config is loaded, no file is written, nothing is reloaded.
+    This editor is scoped on purpose. It owns the <span class="font-medium">:80</span> tunnel blocks,
+    snippets and global options — the parts of the file the model does not. Anything that changes a
+    <span class="font-medium">:443</span> route, the basic-auth accounts, the upstream dials,
+    <code class="font-mono">automatic_https</code> or <code class="font-mono">apps.tls</code> is refused, because
+    those are rebuilt from the proxy-host table and belong in the forms.
   </p>
-  {{if .FromBuf}}<div class="text-xs text-brand-700 font-medium">Showing the validated buffer, not the file on disk.</div>{{end}}
-  <textarea name="content" rows="18" spellcheck="false"
+  <p class="text-xs text-ink-500">
+    A save runs: validate (<code class="font-mono">/adapt</code>) → ownership guard → snapshot → in-place write →
+    reload → model sync (so srv0 ends in the rows' shape, not the file's). A rejected reload rolls the file back.
+  </p>
+  {{if .FromBuf}}<div class="text-xs text-brand-700 font-medium">Showing the submitted buffer, not the file on disk ({{.BaseSHA}} on disk).</div>{{end}}
+  <input type="hidden" name="base_sha" value="{{.BaseSHA}}">
+  <textarea name="content" rows="20" spellcheck="false"
     class="w-full font-mono text-xs leading-relaxed border border-ink-200 rounded-lg p-3 bg-ink-50/30 text-ink-800 focus:outline-none focus:ring-2 focus:ring-brand-300">{{.Buffer}}</textarea>
-  <div class="flex items-center gap-3">
+  <label class="flex items-start gap-2 text-xs text-ink-700">
+    <input type="checkbox" name="confirm" value="on" class="mt-0.5">
+    <span>I understand this writes the production Caddyfile and reloads the front door.</span>
+  </label>
+  <div class="flex items-center gap-3 flex-wrap">
     <button type="submit" class="inline-flex items-center gap-1.5 bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium px-4 py-2 rounded-lg transition">
-      Validate (adapt only)
+      Save &amp; reload
+    </button>
+    <button type="submit" formaction="/caddyfile/validate" class="inline-flex items-center gap-1.5 bg-white border border-ink-200 hover:bg-ink-50 text-ink-700 text-sm font-medium px-4 py-2 rounded-lg transition">
+      Validate only (runs nothing)
     </button>
     <a href="/caddyfile" class="text-sm text-ink-500 hover:text-ink-700">Reload the file from disk</a>
   </div>

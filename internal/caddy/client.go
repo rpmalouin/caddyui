@@ -340,6 +340,29 @@ func (c *Client) Adapt(caddyfile string) (*AdaptResult, error) {
 	return &out, nil
 }
 
+// LoadCaddyfile POSTs Caddyfile source to /load as text/caddyfile — this APPLIES
+// it. Unlike Adapt (which runs nothing), a call here replaces the live config,
+// so the caller owns the safety: validate, guard and snapshot first, and be ready
+// to write the previous file back if Caddy refuses the reload.
+func (c *Client) LoadCaddyfile(src string) error {
+	req, err := http.NewRequest(http.MethodPost, c.AdminURL+"/load", strings.NewReader(src))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "text/caddyfile")
+	c.applyAuth(req)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("caddy load: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("caddy rejected the Caddyfile: %s", strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
 func (c *Client) send(method, path string, val any) error {
 	body, err := json.Marshal(val)
 	if err != nil {

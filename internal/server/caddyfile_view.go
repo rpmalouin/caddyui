@@ -66,6 +66,11 @@ type caddyfilePage struct {
 	Drift     []serverDrift
 	DriftOK   bool
 	Blocks    []caddyfileBlock
+	BaseSHA   string
+	SaveOK    string
+	SaveErr   string
+	Forbidden []string
+	Allowed   []string
 	ServerID  int64
 	ServerNm  string
 	ServerTyp string
@@ -374,6 +379,12 @@ func driftBetween(file, live map[string]serverIndex) []serverDrift {
 
 // --- page assembly ----------------------------------------------------------
 
+// sha256Hex is the file hash the editor round-trips as its concurrency token.
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
 func (p *caddyfilePage) fillMeta(content string) {
 	p.Bytes = len(content)
 	if content == "" {
@@ -460,6 +471,9 @@ func (s *Server) renderCaddyfilePage(w http.ResponseWriter, r *http.Request, pag
 	if page.Path != "" {
 		if b, err := os.ReadFile(page.Path); err == nil {
 			page.fillMeta(string(b))
+			// The save path is optimistic: this is the hash of the file the page
+			// was rendered from, and a save whose base no longer matches is refused.
+			page.BaseSHA = page.SHA256
 		}
 	}
 	if page.ReadErr == "" && page.Path != "" {

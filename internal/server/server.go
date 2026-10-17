@@ -838,6 +838,11 @@ func (s *Server) Routes() http.Handler {
 			// would be a second source of truth in front of production.
 			r.Get("/caddyfile", s.getCaddyfileView)
 			r.Post("/caddyfile/validate", s.postCaddyfileValidate)
+			// The scoped write path: refuses any change to what the model owns on
+			// :443, snapshots first, writes in place, reloads, then re-syncs so the
+			// rows are the last writer. Registered here, in the admin group, because
+			// it writes the production front-door file.
+			r.Post("/caddyfile/save", s.postCaddyfileSave)
 			// v2.58.0 (issue #122): Layer4 (TCP/UDP) proxies. Admin-only — a
 			// layer4 listener opens a port on the host and forwards to anything
 			// the host can reach.
