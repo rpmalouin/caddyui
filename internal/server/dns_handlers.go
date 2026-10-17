@@ -1122,12 +1122,25 @@ func semverGT(a, b string) bool {
 
 func semverParts(v string) [3]int {
 	var out [3]int
-	if len(v) > 0 && v[0] == 'v' {
+	v = strings.TrimSpace(v)
+	if len(v) > 0 && (v[0] == 'v' || v[0] == 'V') {
 		v = v[1:]
+	}
+	// Drop a pre-release / build-metadata suffix: a local build stamp such as
+	// "v2.65.1-secfix" or "v2.65.1+custom" is the SAME upstream release, and
+	// parsing "1-secfix" as 0 made the dashboard offer an update to the version
+	// already running.
+	if i := strings.IndexAny(v, "-+~_"); i >= 0 {
+		v = v[:i]
 	}
 	parts := strings.SplitN(v, ".", 3)
 	for i := 0; i < 3 && i < len(parts); i++ {
-		out[i], _ = strconv.Atoi(parts[i])
+		digits := parts[i]
+		j := 0
+		for j < len(digits) && digits[j] >= '0' && digits[j] <= '9' {
+			j++
+		}
+		out[i], _ = strconv.Atoi(digits[:j])
 	}
 	return out
 }
