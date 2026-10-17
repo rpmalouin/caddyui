@@ -144,6 +144,7 @@
   "nav.api_reference": "API 参考",
   "nav.api_tokens": "API 令牌",
   "nav.caddy_config": "Caddy 配置",
+  "nav.caddyfile": "Caddyfile 文件",
   "nav.caddy_fleet": "Caddy 集群",
   "nav.certificates": "证书",
   "nav.documentation": "文档",

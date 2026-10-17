@@ -1,0 +1,199 @@
+{{define "title"}}Caddyfile · CaddyUI{{end}}
+{{define "content"}}
+<div class="mb-6">
+  <h1 class="text-2xl font-semibold tracking-tight text-ink-900">Caddyfile</h1>
+  <p class="text-sm text-ink-500 mt-1 max-w-3xl">
+    The file mounted at <code class="font-mono text-xs bg-ink-100 px-1 rounded">{{.Page.Path}}</code>,
+    read-only. CaddyUI's model owns <span class="font-medium">srv0 (:443)</span>: the app rebuilds those routes
+    from the proxy hosts table on every start and save. This file is what Caddy loads at boot and what a by-hand
+    <code class="font-mono text-xs bg-ink-100 px-1 rounded">caddy reload</code> applies — so the comparison
+    below is "what this file would serve" against "what is serving now", host by host.
+  </p>
+  <p class="text-xs text-ink-400 mt-2">
+    Validation runs Caddy's <code class="font-mono">/adapt</code>, which parses the file and runs no config.
+    Nothing on this page can change Caddy.
+  </p>
+</div>
+
+{{with .Page}}
+{{if .ReadErr}}
+<div data-toast="error" class="bg-red-50 border border-red-200 rounded-xl px-5 py-3 mb-5 text-sm text-red-700">{{.ReadErr}}</div>
+{{end}}
+
+<div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6 max-w-5xl">
+  <div class="bg-white border border-ink-200 rounded-xl px-4 py-3">
+    <div class="text-xs uppercase tracking-wider text-ink-500">Lines</div>
+    <div class="text-lg font-semibold text-ink-900 mt-0.5">{{.Lines}}</div>
+  </div>
+  <div class="bg-white border border-ink-200 rounded-xl px-4 py-3">
+    <div class="text-xs uppercase tracking-wider text-ink-500">Bytes</div>
+    <div class="text-lg font-semibold text-ink-900 mt-0.5">{{.Bytes}}</div>
+  </div>
+  <div class="bg-white border border-ink-200 rounded-xl px-4 py-3">
+    <div class="text-xs uppercase tracking-wider text-ink-500">Line endings</div>
+    <div class="text-lg font-semibold text-ink-900 mt-0.5">{{if .CRLF}}CRLF{{else}}LF{{end}}</div>
+  </div>
+  <div class="bg-white border border-ink-200 rounded-xl px-4 py-3">
+    <div class="text-xs uppercase tracking-wider text-ink-500">sha256</div>
+    <div class="text-xs font-mono text-ink-700 mt-1 break-all">{{.SHA256}}</div>
+  </div>
+</div>
+
+{{if .ServerNm}}
+<div class="text-xs text-ink-400 mb-4">
+  Caddy server record: <span class="font-medium text-ink-600">{{.ServerNm}}</span>
+  (type={{.ServerTyp}})
+  {{if eq .ServerTyp "managed"}}— the model pushes srv0 on every start and save{{end}}
+</div>
+{{end}}
+
+{{if .AdminErr}}
+<div class="bg-red-50 border border-red-200 rounded-xl px-5 py-3 mb-5 max-w-5xl">
+  <div class="font-medium text-sm text-red-800">Caddy's admin API refused the request</div>
+  <div class="text-xs mt-1 font-mono whitespace-pre-wrap break-all text-red-700">{{.AdminErr}}</div>
+  <div class="text-xs mt-2 text-red-700">
+    This is a wiring problem, not a problem with the file: the Caddyfile was never parsed.
+    Check the server record's admin URL and that the admin Host header override matches it
+    (<code class="font-mono">CADDYUI_ADMIN_HOST_HEADER</code>). Nothing here changes Caddy.
+  </div>
+</div>
+{{end}}
+
+{{if .AdaptErr}}
+<div class="bg-red-50 border border-red-200 rounded-xl px-5 py-3 mb-5 max-w-5xl">
+  <div class="font-medium text-sm text-red-800">The Caddyfile does not adapt</div>
+  <div class="text-xs mt-1 font-mono whitespace-pre-wrap break-all text-red-700">{{.AdaptErr}}</div>
+  <div class="text-xs mt-2 text-red-700">
+    A by-hand reload of this file would fail — the live config would stay as it is. The site blocks below
+    cannot be compared against production until this parses.
+  </div>
+</div>
+{{end}}
+
+{{if .LiveErr}}
+<div class="bg-amber-50 border border-amber-200 rounded-xl px-5 py-3 mb-5 text-sm text-amber-800 max-w-5xl">
+  Live config unavailable: <span class="font-mono text-xs">{{.LiveErr}}</span> — the drift comparison is skipped.
+</div>
+{{end}}
+
+{{if .Warnings}}
+<div class="bg-amber-50 border border-amber-200 rounded-xl px-5 py-3 mb-5 max-w-5xl">
+  <div class="font-medium text-sm text-amber-900">Adapter warnings</div>
+  <ul class="text-xs mt-1 text-amber-800 list-disc list-inside space-y-0.5">
+    {{range .Warnings}}<li>{{.}}</li>{{end}}
+  </ul>
+</div>
+{{end}}
+
+{{if .DriftOK}}
+<div class="mb-2 flex items-center gap-3">
+  <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-600">Drift — this file vs. live</h2>
+  {{if .Drift}}
+    <span class="text-xs text-ink-400">per host: host set, dial targets, basicauth accounts, request headers</span>
+  {{end}}
+</div>
+<div class="space-y-4 max-w-5xl mb-8">
+  {{range .Drift}}
+  <div class="bg-white border border-ink-200 rounded-xl shadow-card overflow-hidden">
+    <div class="bg-ink-50/50 px-5 py-3 border-b border-ink-100 flex items-center gap-3 flex-wrap text-xs">
+      <span class="font-semibold text-ink-800">{{.Name}}</span>
+      <span class="text-ink-500">listen {{.ListenFile}} vs live {{.ListenLive}}</span>
+      <span class="text-ink-500">hosts {{.HostsFile}} vs {{.HostsLive}}</span>
+      <span class="text-ink-500">routes {{.RoutesFile}} vs {{.RoutesLive}}</span>
+      {{if .OnlyFile}}<span class="bg-sky-50 text-sky-700 px-2 py-0.5 rounded-full">{{len .OnlyFile}} only in file</span>{{end}}
+      {{if .OnlyLive}}<span class="bg-amber-50 text-amber-700 px-2 py-0.5 rounded-full">{{len .OnlyLive}} only live</span>{{end}}
+      {{if .Changed}}<span class="bg-red-50 text-red-700 px-2 py-0.5 rounded-full">{{len .Changed}} differ</span>{{end}}
+      {{if and (not .OnlyFile) (not .OnlyLive) (not .Changed)}}<span class="bg-emerald-50 text-emerald-700 px-2 py-0.5 rounded-full">equivalent</span>{{end}}
+      {{if gt .Matcherless 0}}<span class="bg-ink-100 text-ink-600 px-2 py-0.5 rounded-full">{{.Matcherless}} matcherless live</span>{{end}}
+      {{if .Dupes}}<span class="bg-red-50 text-red-700 px-2 py-0.5 rounded-full">duplicate host match: {{range .Dupes}}{{.}} {{end}}</span>{{end}}
+    </div>
+    {{if or .OnlyFile .OnlyLive .Changed}}
+    <table class="w-full text-sm">
+      <thead class="bg-ink-50/50 text-left text-xs uppercase tracking-wider text-ink-500">
+        <tr>
+          <th class="px-5 py-2 font-medium">Host</th>
+          <th class="px-5 py-2 font-medium">Verdict</th>
+          <th class="px-5 py-2 font-medium">What changes</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-ink-100">
+        {{range .OnlyFile}}
+        <tr>
+          <td class="px-5 py-2 font-mono text-xs text-ink-800">{{.}}</td>
+          <td class="px-5 py-2"><span class="text-xs bg-sky-50 text-sky-700 px-2 py-0.5 rounded-full">only in the file</span></td>
+          <td class="px-5 py-2 text-xs text-ink-500">a reload would add this route; a managed sync would not create it</td>
+        </tr>
+        {{end}}
+        {{range .OnlyLive}}
+        <tr>
+          <td class="px-5 py-2 font-mono text-xs text-ink-800">{{.}}</td>
+          <td class="px-5 py-2"><span class="text-xs bg-amber-50 text-amber-700 px-2 py-0.5 rounded-full">only live</span></td>
+          <td class="px-5 py-2 text-xs text-ink-500">the model serves this and the file does not — a reload would DROP it</td>
+        </tr>
+        {{end}}
+        {{range .Changed}}
+        <tr>
+          <td class="px-5 py-2 font-mono text-xs text-ink-800">{{.Host}}</td>
+          <td class="px-5 py-2"><span class="text-xs bg-red-50 text-red-700 px-2 py-0.5 rounded-full">differs</span></td>
+          <td class="px-5 py-2 text-xs text-ink-600 space-y-0.5">
+            {{range .Detail}}<div class="font-mono break-all">{{.}}</div>{{end}}
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+    {{end}}
+  </div>
+  {{end}}
+</div>
+{{end}}
+
+{{if .Blocks}}
+<h2 class="text-sm font-semibold uppercase tracking-wider text-ink-600 mb-2">Blocks and who owns them</h2>
+<div class="bg-white border border-ink-200 rounded-xl shadow-card overflow-hidden max-w-5xl mb-8">
+  <table class="w-full text-sm">
+    <thead class="bg-ink-50/50 text-left text-xs uppercase tracking-wider text-ink-500">
+      <tr>
+        <th class="px-5 py-2 font-medium">Site address</th>
+        <th class="px-5 py-2 font-medium">Kind</th>
+        <th class="px-5 py-2 font-medium">Owner</th>
+        <th class="px-5 py-2 font-medium">What that means</th>
+      </tr>
+    </thead>
+    <tbody class="divide-y divide-ink-100">
+      {{range .Blocks}}
+      <tr>
+        <td class="px-5 py-2 font-mono text-xs text-ink-800 break-all">{{.Head}}</td>
+        <td class="px-5 py-2 text-xs text-ink-500">{{.Kind}}</td>
+        <td class="px-5 py-2 text-xs">
+          {{if eq .Owner "model row DISABLED"}}<span class="bg-red-50 text-red-700 px-2 py-0.5 rounded-full">{{.Owner}}</span>
+          {{else if eq .Owner "not in the model"}}<span class="bg-amber-50 text-amber-700 px-2 py-0.5 rounded-full">{{.Owner}}</span>
+          {{else if eq .Owner "model (enabled)"}}<span class="bg-emerald-50 text-emerald-700 px-2 py-0.5 rounded-full">{{.Owner}}</span>
+          {{else}}<span class="bg-ink-100 text-ink-600 px-2 py-0.5 rounded-full">{{.Owner}}</span>{{end}}
+        </td>
+        <td class="px-5 py-2 text-xs text-ink-500">{{.Note}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+</div>
+{{end}}
+
+<h2 class="text-sm font-semibold uppercase tracking-wider text-ink-600 mb-2">Validate a change</h2>
+<form method="post" action="/caddyfile/validate" class="bg-white border border-ink-200 rounded-xl shadow-card p-5 max-w-5xl mb-8 space-y-3">
+  <p class="text-xs text-ink-500">
+    Edit the text and press Validate. It is sent to Caddy's <code class="font-mono">/adapt</code> only —
+    no config is loaded, no file is written, nothing is reloaded.
+  </p>
+  {{if .FromBuf}}<div class="text-xs text-brand-700 font-medium">Showing the validated buffer, not the file on disk.</div>{{end}}
+  <textarea name="content" rows="18" spellcheck="false"
+    class="w-full font-mono text-xs leading-relaxed border border-ink-200 rounded-lg p-3 bg-ink-50/30 text-ink-800 focus:outline-none focus:ring-2 focus:ring-brand-300">{{.Buffer}}</textarea>
+  <div class="flex items-center gap-3">
+    <button type="submit" class="inline-flex items-center gap-1.5 bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium px-4 py-2 rounded-lg transition">
+      Validate (adapt only)
+    </button>
+    <a href="/caddyfile" class="text-sm text-ink-500 hover:text-ink-700">Reload the file from disk</a>
+  </div>
+</form>
+{{end}}
+{{end}}

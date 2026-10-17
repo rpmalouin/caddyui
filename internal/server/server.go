@@ -832,6 +832,12 @@ func (s *Server) Routes() http.Handler {
 			// keys and DNS API tokens from /caddy-config and a customer-level
 			// user could download the whole database from /backup.
 			r.Get("/caddy-config", s.getCaddyConfig)
+			// Read-only Caddyfile view + /adapt validation. Deliberately NOT a
+			// write path: CaddyUI's model owns srv0, and /load applies whatever
+			// it accepts (validate_only is a no-op in Caddy), so a "save" here
+			// would be a second source of truth in front of production.
+			r.Get("/caddyfile", s.getCaddyfileView)
+			r.Post("/caddyfile/validate", s.postCaddyfileValidate)
 			// v2.58.0 (issue #122): Layer4 (TCP/UDP) proxies. Admin-only — a
 			// layer4 listener opens a port on the host and forwards to anything
 			// the host can reach.

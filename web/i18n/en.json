@@ -144,6 +144,7 @@
   "nav.api_reference": "API Reference",
   "nav.api_tokens": "API Tokens",
   "nav.caddy_config": "Caddy Config",
+  "nav.caddyfile": "Caddyfile",
   "nav.caddy_fleet": "Caddy Fleet",
   "nav.certificates": "Certificates",
   "nav.documentation": "Documentation",

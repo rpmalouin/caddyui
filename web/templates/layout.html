@@ -488,6 +488,7 @@ if ('serviceWorker' in navigator) {
           {{template "navItem" (dict "Section" $sec "Active" "certs" "Href" "/certificates" "Label" (t $ "nav.certificates") "Icon" "lock")}}
           {{if eq .User.Role "admin"}}{{template "navItem" (dict "Section" $sec "Active" "snapshots" "Href" "/snapshots" "Label" (t $ "nav.snapshots") "Icon" "camera")}}{{end}}
           {{if eq .User.Role "admin"}}{{template "navItem" (dict "Section" $sec "Active" "caddy_config" "Href" "/caddy-config" "Label" (t $ "nav.caddy_config") "Icon" "code")}}{{end}}
+          {{if eq .User.Role "admin"}}{{template "navItem" (dict "Section" $sec "Active" "caddyfile" "Href" "/caddyfile" "Label" (t $ "nav.caddyfile") "Icon" "code")}}{{end}}
           {{if eq .User.Role "admin"}}{{template "navItem" (dict "Section" $sec "Active" "import" "Href" "/import" "Label" (t $ "nav.import_from_caddy") "Icon" "download")}}{{end}}
           {{template "navItem" (dict "Section" $sec "Active" "paste" "Href" "/caddyfile-import" "Label" (t $ "nav.paste_caddyfile") "Icon" "clipboard")}}
         </div>
