@@ -27,6 +27,9 @@ type fleetSyncSummary struct {
 	RedirectsCreated    int
 	RedirectsUpdated    int
 	RawRoutesCreated    int
+	Layer4Created       int // v2.58.0 (issue #122)
+	Layer4Updated       int
+	Layer4Skipped       int // node-local
 	RawRoutesUpdated    int
 	// v2.33.0: resources deliberately left behind because they are marked
 	// node-local. Counted and reported rather than silently dropped — an
@@ -43,7 +46,8 @@ func (s fleetSyncSummary) Changed() int {
 	return s.CertificatesCreated + s.CertificatesUpdated +
 		s.ProxiesCreated + s.ProxiesUpdated +
 		s.RedirectsCreated + s.RedirectsUpdated +
-		s.RawRoutesCreated + s.RawRoutesUpdated
+		s.RawRoutesCreated + s.RawRoutesUpdated +
+		s.Layer4Created + s.Layer4Updated
 }
 
 func (s fleetSyncSummary) String() string {
@@ -54,6 +58,12 @@ func (s fleetSyncSummary) String() string {
 		s.RawRoutesCreated, s.RawRoutesUpdated,
 		s.CertificatesCreated, s.CertificatesUpdated,
 	)
+	if s.Layer4Created > 0 || s.Layer4Updated > 0 || s.Layer4Skipped > 0 {
+		out += fmt.Sprintf("; layer4 proxies: %d added, %d updated", s.Layer4Created, s.Layer4Updated)
+		if s.Layer4Skipped > 0 {
+			out += fmt.Sprintf(", %d skipped as node-local", s.Layer4Skipped)
+		}
+	}
 	if s.ProxiesSkipped > 0 || s.RawRoutesSkipped > 0 {
 		out += fmt.Sprintf("; skipped as node-local: %d proxies, %d advanced routes",
 			s.ProxiesSkipped, s.RawRoutesSkipped)
@@ -161,6 +171,14 @@ func preserveProxyTargetPolicy(copy *models.ProxyHost, existing *models.ProxyHos
 }
 
 func (s *Server) upsertFleetProxyHost(sourceServerID, targetServerID int64, source models.ProxyHost, ownerID int64) (fleetUpsertResult, error) {
+	// v2.57.1: the owner decides whether this copy may adopt an existing target
+	// row, and callers pass a FORM-PARSED source whose OwnerID is not populated
+	// (the owner is given to the insert separately). Always read it from the row.
+	if source.ID > 0 {
+		if cur, err := models.GetProxyHost(s.DB, source.ID); err == nil && cur != nil {
+			source.OwnerID = cur.OwnerID
+		}
+	}
 	targetID, err := s.mappedFleetTarget(sourceServerID, models.FleetResourceProxy, source.ID, targetServerID)
 	if err != nil {
 		return fleetUpsertResult{}, err
@@ -177,7 +195,12 @@ func (s *Server) upsertFleetProxyHost(sourceServerID, targetServerID int64, sour
 			return fleetUpsertResult{}, err
 		}
 		for i := range targets {
-			if sameDomainSet(targets[i].DomainList(), source.DomainList()) {
+			// Security (v2.57.1): a copy of a TENANT-owned source row may only
+			// update the target row this source already created (the mapping
+			// above). Adopting an unrelated row that merely has the same
+			// domains let one customer overwrite another's host — or an
+			// admin's — on the target, and reset its owner.
+			if !s.isTenantOwner(source.OwnerID) && sameDomainSet(targets[i].DomainList(), source.DomainList()) {
 				existing = &targets[i]
 				targetID = targets[i].ID
 				break
@@ -215,6 +238,16 @@ func (s *Server) upsertFleetProxyHost(sourceServerID, targetServerID int64, sour
 	if err != nil {
 		return fleetUpsertResult{}, err
 	}
+	// v2.60.0 (issue #124): the copy uses the same middleware profile (profiles
+	// are global), so a profile change on the source reaches the target too. A
+	// different attachment counts as a change, so the target is re-synced.
+	wantProfile := models.ProxyHostProfileID(s.DB, source.ID)
+	if models.ProxyHostProfileID(s.DB, targetID) != wantProfile {
+		if err := models.SetProxyHostProfile(s.DB, targetID, wantProfile); err != nil {
+			return fleetUpsertResult{}, err
+		}
+		changed = true
+	}
 	if err := models.SaveFleetDeployment(s.DB, sourceServerID, models.FleetResourceProxy, source.ID, targetServerID, targetID); err != nil {
 		return fleetUpsertResult{}, err
 	}
@@ -248,6 +281,11 @@ func preserveRedirectTargetPolicy(copy *models.RedirectionHost, existing *models
 }
 
 func (s *Server) upsertFleetRedirectionHost(sourceServerID, targetServerID int64, source models.RedirectionHost, ownerID int64) (fleetUpsertResult, error) {
+	if source.ID > 0 { // v2.57.1: owner from the row, not the caller's form-parsed copy — see upsertFleetProxyHost
+		if cur, err := models.GetRedirectionHost(s.DB, source.ID); err == nil && cur != nil {
+			source.OwnerID = cur.OwnerID
+		}
+	}
 	targetID, err := s.mappedFleetTarget(sourceServerID, models.FleetResourceRedirect, source.ID, targetServerID)
 	if err != nil {
 		return fleetUpsertResult{}, err
@@ -264,7 +302,12 @@ func (s *Server) upsertFleetRedirectionHost(sourceServerID, targetServerID int64
 			return fleetUpsertResult{}, err
 		}
 		for i := range targets {
-			if sameDomainSet(targets[i].DomainList(), source.DomainList()) {
+			// Security (v2.57.1): a copy of a TENANT-owned source row may only
+			// update the target row this source already created (the mapping
+			// above). Adopting an unrelated row that merely has the same
+			// domains let one customer overwrite another's host — or an
+			// admin's — on the target, and reset its owner.
+			if !s.isTenantOwner(source.OwnerID) && sameDomainSet(targets[i].DomainList(), source.DomainList()) {
 				existing = &targets[i]
 				targetID = targets[i].ID
 				break
@@ -343,6 +386,11 @@ func preserveRawRouteTargetPolicy(copy *models.RawRoute, existing *models.RawRou
 }
 
 func (s *Server) upsertFleetRawRoute(sourceServerID, targetServerID int64, source models.RawRoute, ownerID int64) (fleetUpsertResult, error) {
+	if source.ID > 0 { // v2.57.1: owner from the row, not the caller's form-parsed copy — see upsertFleetProxyHost
+		if cur, err := models.GetRawRoute(s.DB, source.ID); err == nil && cur != nil {
+			source.OwnerID = cur.OwnerID
+		}
+	}
 	targetID, err := s.mappedFleetTarget(sourceServerID, models.FleetResourceRawRoute, source.ID, targetServerID)
 	if err != nil {
 		return fleetUpsertResult{}, err
@@ -359,7 +407,7 @@ func (s *Server) upsertFleetRawRoute(sourceServerID, targetServerID int64, sourc
 			return fleetUpsertResult{}, err
 		}
 		for i := range targets {
-			if rawRouteIdentityMatches(targets[i], source) {
+			if !s.isTenantOwner(source.OwnerID) && rawRouteIdentityMatches(targets[i], source) { // v2.57.1: see upsertFleetProxyHost
 				existing = &targets[i]
 				targetID = targets[i].ID
 				break
@@ -441,21 +489,106 @@ func fleetCertificateCopy(source models.Certificate, roots []string) (copy model
 	return copy, byPath
 }
 
+// sourcePushCertificateCopy builds the target-side copy for a Managed ACME
+// certificate in "source push" fleet-distribution mode (v2.55.0, issue #115):
+// instead of cloning the DNS-01 definition so the target orders its own
+// certificate — fleetCertificateCopy's default for CertSourceManaged — it
+// reads the source server's current certificate and private key straight out
+// of Caddy's on-disk storage (findStorageCertificate, the same read path the
+// v2.42.0 "export to a directory" feature uses) and hands back a plain PEM
+// certificate. A live TLS probe (the other existing read path, used by
+// certificate_probe.go) can never substitute for this: a TLS handshake never
+// reveals the server's private key, only the public leaf certificate.
+//
+// The result deliberately carries neither DNS credentials nor the
+// fleet-distribution fields: it is a plain PEM copy like any other, so the
+// target needs no DNS provider, gets no automation-policy entry of its own,
+// and is not itself mistaken for a push source if it is later used as one.
+//
+// Returns an error when the source has no Data directory configured, or has
+// not completed its own ACME order yet. Callers must treat that as "try
+// again on the next pass" and must not create or overwrite a target row with
+// an empty or partial certificate.
+func (s *Server) sourcePushCertificateCopy(sourceServerID int64, source models.Certificate) (models.Certificate, error) {
+	srv, err := models.GetCaddyServer(s.DB, sourceServerID)
+	if err != nil || srv == nil {
+		return models.Certificate{}, fmt.Errorf("load source environment %d: %w", sourceServerID, err)
+	}
+	if strings.TrimSpace(srv.DataDir) == "" {
+		return models.Certificate{}, fmt.Errorf("%s has no Data directory configured — set one under Caddy Fleet → edit server so CaddyUI can read the certificate it obtains for fleet distribution", srv.Name)
+	}
+	dataDir, err := safeAbsolutePath(srv.DataDir)
+	if err != nil {
+		return models.Certificate{}, fmt.Errorf("%s data directory: %w", srv.Name, err)
+	}
+	roots := s.certificateReadRoots()
+	stored, err := findStorageCertificate(dataDir, source.DomainList(), roots)
+	if err != nil {
+		return models.Certificate{}, fmt.Errorf("%s has not completed its own ACME order for this certificate yet: %w", srv.Name, err)
+	}
+	certPEM, err := readCertificateFile(stored.CertPath, roots)
+	if err != nil {
+		return models.Certificate{}, fmt.Errorf("read %s: %w", stored.CertPath, err)
+	}
+	keyPEM, err := readCertificateFile(stored.KeyPath, roots)
+	if err != nil {
+		return models.Certificate{}, fmt.Errorf("read %s: %w", stored.KeyPath, err)
+	}
+	copy := source
+	copy.OwnerID = sql.NullInt64{}
+	copy.OwnerEmail = ""
+	copy.CreatedAt = time.Time{}
+	copy.UpdatedAt = time.Time{}
+	copy.Source = models.CertSourcePEM
+	copy.CertPEM, copy.KeyPEM = strings.TrimSpace(string(certPEM)), strings.TrimSpace(string(keyPEM))
+	copy.CertPath, copy.KeyPath = "", ""
+	copy.DNSProvider, copy.DNSProfileID = "", ""
+	copy.FleetDistributionMode, copy.FleetPushTargets = "", ""
+	return copy, nil
+}
+
 // fleetCertificateMatches pairs a source certificate with a target row that
 // has no deployment mapping yet: same domain set and the same kind (managed
 // with managed, custom with custom — a PEM copy of a file-path source is
 // still custom). Name breaks ties.
+//
+// v2.55.0 (issue #115): a Managed source in "source push" fleet-distribution
+// mode produces a PEM copy, not a managed one (see sourcePushCertificateCopy),
+// so it is compared as non-managed here too — otherwise a target's existing
+// pushed PEM copy would never be recognized as "the same certificate" on a
+// fresh scan (no deployment mapping yet) and a duplicate row would be created
+// alongside it.
 func fleetCertificateMatches(target, source models.Certificate) bool {
 	if !sameDomainSet(target.DomainList(), source.DomainList()) {
 		return false
 	}
-	return (target.Source == models.CertSourceManaged) == (source.Source == models.CertSourceManaged)
+	sourceBecomesManagedCopy := source.Source == models.CertSourceManaged &&
+		source.FleetDistributionMode != models.CertFleetDistributionSourcePush
+	return (target.Source == models.CertSourceManaged) == sourceBecomesManagedCopy
 }
 
 // upsertFleetCertificate creates or updates the target's copy of source
 // (see fleetCertificateCopy) and records the deployment mapping. byPath is
 // true when a file-path certificate could only be copied by reference.
+//
+// v2.55.0 (issue #115): when source is a Managed ACME certificate in "source
+// push" fleet-distribution mode, the target does not get its own DNS-01
+// definition (fleetCertificateCopy's default for CertSourceManaged) — it gets
+// the source's actual certificate and private key, read off the source
+// server's Caddy storage (sourcePushCertificateCopy), so it needs no DNS
+// credentials and gets no automation-policy entry of its own
+// (buildDNSAutomationPolicies only emits one for Source == CertSourceManaged).
+// An error here (no Data directory configured, or the source hasn't
+// completed its own ACME order yet) is returned as-is: every caller already
+// treats an error from this function as "skip this one and keep going," so
+// nothing is created or overwritten on the target, and the next certificate
+// lifecycle reconciler pass simply tries again.
 func (s *Server) upsertFleetCertificate(sourceServerID, targetServerID int64, source models.Certificate, ownerID int64) (result fleetUpsertResult, byPath bool, err error) {
+	if source.ID > 0 { // v2.57.1: owner from the row, not the caller's form-parsed copy — see upsertFleetProxyHost
+		if cur, err := models.GetCertificate(s.DB, source.ID); err == nil && cur != nil {
+			source.OwnerID = cur.OwnerID
+		}
+	}
 	targetID, err := s.mappedFleetTarget(sourceServerID, models.FleetResourceCertificate, source.ID, targetServerID)
 	if err != nil {
 		return fleetUpsertResult{}, false, err
@@ -472,13 +605,21 @@ func (s *Server) upsertFleetCertificate(sourceServerID, targetServerID int64, so
 			return fleetUpsertResult{}, false, err
 		}
 		for i := range targets {
-			if fleetCertificateMatches(targets[i], source) && (existing == nil || targets[i].Name == source.Name) {
+			if !s.isTenantOwner(source.OwnerID) && fleetCertificateMatches(targets[i], source) && (existing == nil || targets[i].Name == source.Name) { // v2.57.1
 				existing = &targets[i]
 				targetID = targets[i].ID
 			}
 		}
 	}
-	copy, byPath := fleetCertificateCopy(source, s.certificateReadRoots())
+	var copy models.Certificate
+	if source.Source == models.CertSourceManaged && source.FleetDistributionMode == models.CertFleetDistributionSourcePush {
+		copy, err = s.sourcePushCertificateCopy(sourceServerID, source)
+		if err != nil {
+			return fleetUpsertResult{}, false, err
+		}
+	} else {
+		copy, byPath = fleetCertificateCopy(source, s.certificateReadRoots())
+	}
 	created := existing == nil
 	changed := true
 	if existing != nil {
@@ -606,6 +747,28 @@ func (s *Server) syncFleetConfiguration(actor string, sourceServerID, targetServ
 			summary.RawRoutesCreated++
 		} else if result.Changed {
 			summary.RawRoutesUpdated++
+		}
+	}
+
+	// v2.58.0 (issue #122): Layer4 proxies travel with the rest.
+	layer4Proxies, err := models.ListLayer4Proxies(s.DB, sourceServerID)
+	if err != nil {
+		syncErrors = append(syncErrors, fmt.Errorf("list source layer4 proxies: %w", err))
+	}
+	for _, l4 := range layer4Proxies {
+		if l4.NodeLocal {
+			summary.Layer4Skipped++
+			continue
+		}
+		result, err := s.upsertFleetLayer4Proxy(sourceServerID, targetServerID, l4)
+		if err != nil {
+			syncErrors = append(syncErrors, fmt.Errorf("layer4 proxy %q: %w", l4.Name, err))
+			continue
+		}
+		if result.Created {
+			summary.Layer4Created++
+		} else if result.Changed {
+			summary.Layer4Updated++
 		}
 	}
 

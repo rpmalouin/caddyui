@@ -36,10 +36,13 @@ services:
       - caddy_config:/config
     environment:
       CADDY_ADMIN: 0.0.0.0:2019
-    command: >-
-      mkdir -p /config/caddy;
-      [ -f /config/caddy/autosave.json ] || echo '{}' > /config/caddy/autosave.json;
-      exec caddy run --config /config/caddy/autosave.json --resume --adapter json
+    command:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /config/caddy
+        [ -f /config/caddy/autosave.json ] || echo '{}' > /config/caddy/autosave.json
+        exec caddy run --config /config/caddy/autosave.json --resume --adapter json
 
   caddyui:
     image: applegater/caddyui:latest
@@ -58,7 +61,7 @@ volumes:
 
 > **💡 Fresh install:** On first boot Caddy has no saved config yet. The `command` above seeds an empty `{}` config automatically so Caddy starts cleanly without any extra steps. Without `--resume`, admin-API pushes from CaddyUI would be lost on every `docker compose restart`.
 
-> **DNS-01 note:** Managed ACME certificates require a Caddy build containing the matching `caddy-dns` provider module. The prebuilt [`applegater/caddyui-caddy`](https://hub.docker.com/r/applegater/caddyui-caddy) image (used above) bundles every DNS provider CaddyUI supports, plus the CrowdSec bouncer and rate-limit modules — it's the published build of the repository's [`Dockerfile.caddy`](https://github.com/X4Applegate/caddyui/blob/main/Dockerfile.caddy), which you can also build yourself. The stock `caddy:2-alpine` image does not include these modules.
+> **DNS-01 note:** Managed ACME certificates require a Caddy build containing the matching `caddy-dns` provider module, and the stock `caddy:2-alpine` image does not include those modules. The example above therefore uses the prebuilt **[`applegater/caddyui-caddy`](https://hub.docker.com/r/applegater/caddyui-caddy)** image — every DNS provider CaddyUI supports, the CrowdSec bouncer, rate limiting and layer4, on the current Caddy, for `amd64` and `arm64`. Prefer your own build? [`Dockerfile.caddy`](https://github.com/X4Applegate/caddyui/blob/main/Dockerfile.caddy) is its source, or supply any compatible Caddy build.
 
 ### Bind-mount note
 
@@ -69,6 +72,20 @@ sudo chown 10001:10001 /path/to/caddyui_data
 ```
 
 The container will print a clear error message at startup if the directory isn't writable.
+
+---
+
+## 🆕 What's new (v2.53 – v2.57)
+
+- **v2.61.0 — Coraza WAF, and Layer4 on a shared port.** Middleware profiles can switch on the Coraza web application firewall (detect or block, OWASP Core Rule Set) — it needs the new `applegater/caddyui-caddy` image, which now includes the module. A Layer4 proxy can also share port 443/80 (SSH or RDP for one hostname next to normal HTTPS) through a caddy-l4 listener wrapper.
+- **v2.60.0 — middleware profiles** (security headers, forward auth, IP restrictions, extra headers, configured once and picked on many hosts) and a **configurable fallback status** for unmatched requests. **v2.59.x — Forward Auth now works, unknown hosts answer 404, opt-in deletion propagation.**
+- **v2.57.1 — security hardening release.** The live Caddy config, database backup, snapshots and Import from Caddy are admin-only; non-admin routes can no longer read Caddy's environment or files through `{env.…}` / `{file.…}` placeholders; API token scopes are enforced everywhere; the login lockout works. **Upgrade if you run user or viewer accounts.** Bundled Caddy is now 2.11.7. Set `CADDYUI_PUBLIC_URL` if you use password reset or invitations.
+- **v2.57.0 — automatic deployment targets.** Pick the servers a Caddy Fleet entry always feeds, so every proxy host, redirection and advanced route saved on it is deployed to them without re-ticking **Also deploy to**.
+- **v2.56.x — layer4 (TCP/UDP) routing** via `caddy-l4`, and **multi-arch images** (`linux/amd64` + `linux/arm64`) for both `applegater/caddyui` and `applegater/caddyui-caddy`.
+- **v2.55.0 — share one managed certificate across fleet nodes:** one Caddy does the ACME order and CaddyUI pushes the certificate to the others.
+- **v2.54.0 — configurable ACME DNS-01 resolver** for split-horizon DNS. **v2.53.0 — certificate file reads confined** to allowlisted directories.
+
+Full release notes: <https://github.com/X4Applegate/caddyui/releases>
 
 ---
 
@@ -110,7 +127,7 @@ CaddyUI v2.21 adds independent rotating file access logs and CrowdSec request pr
 - Store the CrowdSec API key without rendering it back into Settings
 - Exclude exact hosts or Caddy path patterns and test LAPI connectivity after sync
 
-The repository `Dockerfile.caddy` includes the required CrowdSec HTTP bouncer module. Custom Caddy images must include `github.com/hslatman/caddy-crowdsec-bouncer/http`.
+The prebuilt `applegater/caddyui-caddy` image (built from the repository's `Dockerfile.caddy`) includes the required CrowdSec HTTP bouncer module. Custom Caddy images must include `github.com/hslatman/caddy-crowdsec-bouncer/http`.
 
 ### 🧹 Actionable certificate cleanup
 
@@ -255,7 +272,8 @@ Multi-arch: `linux/amd64` + `linux/arm64`. Scratch base image, runs as non-root 
 | `CADDYUI_DB_DSN` | (none) | MariaDB DSN; required when `CADDYUI_DB_DRIVER=mariadb` |
 | `CADDYUI_LISTEN` | `:8080` | HTTP listen address |
 | `CADDYUI_INGEST_LISTEN` | `:9019` | Structured Caddy log ingest for analytics, certificate lifecycle, and temporary runtime streams (empty string disables all three) |
-| `CADDYFILE_PATH` | `/etc/caddy/Caddyfile` | Optional — only read if you mount a Caddyfile into the CaddyUI container for the paste-import auto-classifier reference |
+| `CADDYFILE_PATH` | `/etc/caddy/Caddyfile` | Optional — path to a Caddyfile mounted into the CaddyUI container. Its `(name) { ... }` snippet definitions are auto-loaded so `import <name>` works in Advanced routes, Caddyfile paste import, and a proxy host's Advanced config; site blocks and global options in it are never used |
+| `CADDYUI_PUBLIC_URL` | (none) | Externally visible origin, e.g. `https://caddyui.example.com`. Used for the links in password-reset and invitation emails; without it the link is built from the request's `Host` header |
 | `CADDY_ADMIN_USER` / `CADDY_ADMIN_PASS` | (none) | Optional HTTP basic auth for Caddy's admin endpoint when proxied |
 
 ---

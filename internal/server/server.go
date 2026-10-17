@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/X4Applegate/caddyui/internal/analytics"
@@ -58,7 +59,12 @@ type Server struct {
 	// exist in the scratch final image, and creating it at runtime as a
 	// non-root UID isn't allowed. v2.7.5.
 	DBPath      string
-	pendingTOTP sync.Map // token → userID (int64), auto-deleted after 5 min
+	pendingTOTP sync.Map   // token → userID (int64), auto-deleted after 5 min
+	setupMu     sync.Mutex // serializes first-run setup (see postSetup)
+	syncMu      sync.Mutex // serializes syncCaddy: it swaps the shared s.Caddy client
+	// pendingTOTPAttempts counts wrong second-factor codes per pending token
+	// (token → *int32) so one password check cannot buy unlimited guesses.
+	pendingTOTPAttempts sync.Map
 
 	// CSRF HMAC key, loaded from (or generated into) the settings table on
 	// first use. Per-Server rather than package-level so two Servers in the
@@ -163,6 +169,7 @@ func New(db *sql.DB, caddyClient *caddy.Client, templates fs.FS, static fs.FS, c
 	}
 	go s.runHealthChecker()
 	go s.runAutoSyncLoop()
+	go s.runFleetDeletionReconciler() // v2.59.0 (issue #120)
 	go s.runMaintenanceWindowLoop()
 	go s.runActivityLogCleanup()
 	go s.runAccessDailyAggregator()
@@ -201,6 +208,7 @@ const healthFailThreshold = 3
 
 func parseTemplates(tplFS fs.FS) (map[string]*template.Template, error) {
 	funcs := template.FuncMap{
+		"t":     tFunc, // v2.62.0 (issue #128): {{t $ "key"}}
 		"join":  func(sep string, parts []string) string { return strings.Join(parts, sep) },
 		"upper": strings.ToUpper,
 		// dict builds a map from alternating key/value args so templates can pass
@@ -461,11 +469,37 @@ func parseTemplates(tplFS fs.FS) (map[string]*template.Template, error) {
 	return pages, nil
 }
 
+// safeLogFormatter is chi's request logger minus the query string. The default
+// logger writes the full request URI, and several flows carry a bearer secret in
+// the query: ?token= (password reset, invitations), ?created= (a freshly created
+// API token), ?t= (a pending second-factor token), the OIDC ?code=&state=. Anyone
+// who can read the container logs, Portainer or a log shipper would otherwise be
+// handed a working credential (v2.57.1). The request line is %q-quoted so
+// control characters in a path cannot forge log lines.
+type safeLogFormatter struct{}
+
+func (safeLogFormatter) NewLogEntry(r *http.Request) middleware.LogEntry {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	line := fmt.Sprintf("%s %s://%s%s %s", r.Method, scheme, r.Host, r.URL.Path, r.Proto)
+	return &safeLogEntry{prefix: fmt.Sprintf("%q from %s - ", line, r.RemoteAddr)}
+}
+
+type safeLogEntry struct{ prefix string }
+
+func (e *safeLogEntry) Write(status, bytes int, _ http.Header, elapsed time.Duration, _ interface{}) {
+	log.Printf("%s%d %dB in %s", e.prefix, status, bytes, elapsed)
+}
+
+func (e *safeLogEntry) Panic(v interface{}, stack []byte) { middleware.PrintPrettyStack(v) }
+
 func (s *Server) Routes() http.Handler {
 	r := chi.NewRouter()
 	r.Use(s.adminIPGate)
 	r.Use(s.securityHeaders)
-	r.Use(middleware.Logger)
+	r.Use(middleware.RequestLogger(safeLogFormatter{})) // v2.57.1: path only — see safeLogFormatter
 	r.Use(middleware.Recoverer)
 
 	staticSub, err := fs.Sub(s.Static, ".")
@@ -540,11 +574,7 @@ func (s *Server) Routes() http.Handler {
 		// Read routes — open to both admin and viewer roles.
 		r.Get("/proxy-hosts", s.listProxyHosts)
 		r.Get("/redirection-hosts", s.listRedirectionHosts)
-		r.Get("/import", s.getImport)
 		r.Get("/caddyfile-import", s.getCaddyfileImport)
-		r.Get("/snapshots", s.listSnapshots)
-		r.Get("/snapshots/{id}/download", s.downloadSnapshot)
-		r.Get("/snapshots/{id}/diff", s.getSnapshotDiff)
 		r.Get("/activity", s.listActivityLog)
 		r.Get("/activity/export.csv", s.exportActivityCSV)
 		r.Get("/certificates", s.listCertificates)
@@ -559,7 +589,6 @@ func (s *Server) Routes() http.Handler {
 		r.Get("/raw-routes", s.listRawRoutes)
 		r.Get("/docs", s.getDocs)
 		r.Get("/api/docs", s.getAPIDocs)
-		r.Get("/caddy-config", s.getCaddyConfig)
 
 		// Server picker — available to every authenticated role. The route
 		// only flips the caddyui_server cookie (a per-user preference) so
@@ -579,11 +608,7 @@ func (s *Server) Routes() http.Handler {
 		// instance. /api/ai/status reports whether AI is enabled so the
 		// frontend can hide the floating button when not configured.
 		r.Get("/api/ai/status", s.apiAIStatus)
-		r.Post("/api/ai/chat", s.apiAIChat)
-		// v2.12.11: AI tool calling — model proposes a proxy host or
-		// redirection via tool_calls; user confirms; this endpoint actually
-		// creates it.
-		r.Post("/api/ai/exec-tool", s.apiAIExecTool)
+		r.With(s.requireWrite).Post("/api/ai/chat", s.apiAIChat) // v2.57.1: spends the admin's LLM key — not for read-only accounts
 
 		// v2.12.27: per-user color-theme persistence so the picker in
 		// Settings follows the account across devices instead of being
@@ -592,17 +617,16 @@ func (s *Server) Routes() http.Handler {
 
 		// Live upstream status — proxies Caddy's /reverse_proxy/upstreams response.
 		r.Get("/api/caddy-upstreams", s.apiCaddyUpstreams)
-		r.Post("/api/proxy-hosts/test-upstream", s.apiTestUpstream)
+		r.With(s.requireWrite).Post("/api/proxy-hosts/test-upstream", s.apiTestUpstream) // v2.57.1: writers only
 		// v2.11.13: live Caddyfile/JSON preview — takes the in-progress
 		// proxy-host edit form and returns the route JSON Caddy would see.
-		r.Post("/api/proxy-hosts/preview", s.apiPreviewProxyHost)
+		r.With(s.requireWrite).Post("/api/proxy-hosts/preview", s.apiPreviewProxyHost) // v2.57.1: writers only
 		// v2.9.228: validate a raw-route's Caddyfile/JSON via /load?validate_only=true
 		// before saving the row. Lets the form catch syntax/schema errors at edit
 		// time instead of waiting for the next sync to surface them.
-		r.Post("/api/raw-routes/validate", s.apiValidateRawRoute)
+		r.With(s.requireWrite).Post("/api/raw-routes/validate", s.apiValidateRawRoute) // v2.57.1: writers only
 
 		// Feature F: notifier status API (authenticated).
-		r.Get("/api/notifier-status", s.apiNotifierStatus)
 
 		// Phase 7: system stats API (authenticated, read-only).
 		r.Get("/api/system-stats", s.apiSystemStats)
@@ -653,6 +677,18 @@ func (s *Server) Routes() http.Handler {
 		// Write routes — admin-only in practice. Viewers get 403 via requireWrite.
 		r.Group(func(r chi.Router) {
 			r.Use(s.requireWrite)
+
+			// v2.12.11: AI tool calling — model proposes a proxy host or
+			// redirection via tool_calls; user confirms; this endpoint
+			// actually creates it. GHSA-5h8j-xxm3-7ggr: this was previously
+			// registered outside the requireWrite group above, so a
+			// read-only viewer could reach it directly (bypassing the UI's
+			// own confirmation step entirely) and create proxy hosts or
+			// redirections despite being blocked from every other write
+			// path. Moved here so the same role gate every other mutating
+			// route already gets is no longer something this one handler
+			// has to remember to check for itself.
+			r.Post("/api/ai/exec-tool", s.apiAIExecTool)
 
 			r.Get("/proxy-hosts/new", s.newProxyHost)
 			r.Post("/proxy-hosts", s.createProxyHost)
@@ -710,14 +746,7 @@ func (s *Server) Routes() http.Handler {
 			r.Post("/redirection-hosts/reorder", s.reorderRedirectionHosts)
 
 			r.Post("/caddy/reload", s.reloadCaddy)
-			r.Post("/import", s.postImport)
 			r.Post("/caddyfile-import", s.postCaddyfileImport)
-
-			r.Post("/snapshots", s.createManualSnapshot)
-			r.Post("/snapshots/upload", s.uploadSnapshot)
-			r.Post("/snapshots/auto", s.setAutoSnapshots)
-			r.Post("/snapshots/{id}/restore", s.restoreSnapshot)
-			r.Post("/snapshots/{id}/delete", s.deleteSnapshot)
 
 			// v2.7.2: certificate create + edit are writer-level, not admin-only.
 			// Each cert now carries owner_id (NULL = global/admin, >0 = private
@@ -738,8 +767,6 @@ func (s *Server) Routes() http.Handler {
 			// v2.11.10: bulk delete on /certificates — same ownership / in-use
 			// guards as the single-row deleteCertificate handler.
 			r.Post("/certificates/bulk-delete", s.bulkDeleteCertificates)
-			r.Get("/certificates/import/porkbun", s.importPorkbunCertificatePage)
-			r.Post("/certificates/import/porkbun", s.importPorkbunCertificate)
 
 			r.Get("/raw-routes/new", s.newRawRoute)
 			r.Post("/raw-routes", s.createRawRoute)
@@ -755,7 +782,6 @@ func (s *Server) Routes() http.Handler {
 			r.Post("/raw-routes/reclassify", s.postReclassifyRawRoutes)
 
 			// Phase 7: database backup download.
-			r.Get("/backup", s.getBackup)
 		})
 
 		// TOTP setup — available to all authenticated users.
@@ -798,6 +824,48 @@ func (s *Server) Routes() http.Handler {
 		// User management and settings — admin-only (both read and write).
 		r.Group(func(r chi.Router) {
 			r.Use(s.requireAdmin)
+
+			// Security (v2.57.1): everything that exposes or replaces the live
+			// Caddy config, the database, or the stored credentials is
+			// admin-only. These used to sit in the read-for-any-role and
+			// requireWrite groups, so a viewer could read certificate private
+			// keys and DNS API tokens from /caddy-config and a customer-level
+			// user could download the whole database from /backup.
+			r.Get("/caddy-config", s.getCaddyConfig)
+			// v2.58.0 (issue #122): Layer4 (TCP/UDP) proxies. Admin-only — a
+			// layer4 listener opens a port on the host and forwards to anything
+			// the host can reach.
+			r.Get("/middleware-profiles", s.listMiddlewareProfiles) // v2.60.0 (issue #124)
+			r.Get("/middleware-profiles/new", s.newMiddlewareProfile)
+			r.Post("/middleware-profiles", s.createMiddlewareProfile)
+			r.Get("/middleware-profiles/{id}/edit", s.editMiddlewareProfile)
+			r.Post("/middleware-profiles/{id}", s.updateMiddlewareProfile)
+			r.Post("/middleware-profiles/{id}/delete", s.deleteMiddlewareProfile)
+			r.Get("/layer4-proxies", s.listLayer4Proxies)
+			r.Get("/layer4-proxies/new", s.newLayer4Proxy)
+			r.Post("/layer4-proxies", s.createLayer4Proxy)
+			r.Get("/layer4-proxies/{id}/edit", s.editLayer4Proxy)
+			r.Post("/layer4-proxies/{id}", s.updateLayer4Proxy)
+			r.Post("/layer4-proxies/{id}/toggle", s.toggleLayer4Proxy)
+			r.Post("/layer4-proxies/{id}/delete", s.deleteLayer4Proxy)
+			r.Get("/import", s.getImport)
+			r.Post("/import", s.postImport)
+			r.Get("/snapshots", s.listSnapshots)
+			r.Get("/snapshots/{id}/download", s.downloadSnapshot)
+			r.Get("/snapshots/{id}/diff", s.getSnapshotDiff)
+			r.Post("/snapshots", s.createManualSnapshot)
+			r.Post("/snapshots/upload", s.uploadSnapshot)
+			r.Post("/snapshots/auto", s.setAutoSnapshots)
+			r.Post("/snapshots/{id}/restore", s.restoreSnapshot)
+			r.Post("/snapshots/{id}/delete", s.deleteSnapshot)
+			r.Get("/backup", s.getBackup)
+			// The Porkbun import uses the admin's own Porkbun API keys and
+			// returns SSL bundles including the private key.
+			r.Get("/certificates/import/porkbun", s.importPorkbunCertificatePage)
+			r.Post("/certificates/import/porkbun", s.importPorkbunCertificate)
+			// Webhook / ntfy destinations are bearer secrets.
+			r.Get("/api/notifier-status", s.apiNotifierStatus)
+
 			r.Get("/users", s.listUsers)
 			r.Get("/users/new", s.newUser)
 			r.Post("/users", s.createUser)
@@ -829,6 +897,8 @@ func (s *Server) Routes() http.Handler {
 			r.Post("/servers/{id}/sync-hold/clear", s.clearSyncHoldHandler)   // v2.38.0
 			r.Post("/servers/{id}/sync-error/clear", s.clearSyncErrorHandler) // v2.42.1
 			r.Post("/servers/{id}/delete", s.deleteServer)
+			r.Post("/servers/{id}/pending-deletions/retry", s.retryFleetPendingDeletions)    // v2.59.0 (issue #120)
+			r.Post("/servers/{id}/pending-deletions/discard", s.discardFleetPendingDeletion) // v2.59.0 (issue #120)
 			r.Get("/server-logs", s.getServerLogs)
 			r.Get("/api/server-logs/status", s.serverLogStatus)
 			r.Get("/api/server-logs/stream", s.serverLogStream)
@@ -836,6 +906,7 @@ func (s *Server) Routes() http.Handler {
 			r.Post("/api/server-logs/disable", s.disableServerLogs)
 			r.Post("/api/server-logs/clear", s.clearServerLogs) // v2.35.5 (issue #60)
 			r.Post("/dashboard/recommendations/unused-certificates/dismiss", s.dismissUnusedCertificateRecommendation)
+			r.Post("/dashboard/recommendations/two-factor-policy/dismiss", s.dismissTOTPPolicyRecommendation) // v2.64.2 (issue #138)
 
 			// v2.7.2: create/edit moved up to the requireWrite group so
 			// user-role accounts can manage their own certs. The remaining
@@ -936,9 +1007,16 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 
 // adminIPGate returns a middleware that enforces the admin_allowlist setting.
 // If the setting is empty, all IPs are allowed. Non-matching IPs get 403.
+//
+// v2.65.0 (issue #140): the allowlist is matched against the address from
+// resolvedClientIP, not the raw connection. It used to compare
+// r.RemoteAddr, which behind any reverse proxy is the proxy — so an
+// allowlist naming the real visitor locked that visitor out, and the usual
+// workaround of naming the proxy instead admitted *everyone* who came
+// through it while still reading as "restricted" in the UI.
 func (s *Server) adminIPGate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw, _ := models.GetSetting(s.DB, settingAdminAllowlist)
+		raw := s.adminAllowlist()
 		if raw == "" {
 			next.ServeHTTP(w, r)
 			return
@@ -966,8 +1044,9 @@ func (s *Server) adminIPGate(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		// Extract client IP.
-		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+		// The visitor's address, taken from a forwarded header only when the
+		// connection came from a trusted proxy.
+		clientIP, _ := s.resolvedClientIP(r)
 		ip := net.ParseIP(clientIP)
 		if ip == nil {
 			http.Error(w, "Forbidden", http.StatusForbidden)
@@ -1005,10 +1084,9 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 		if err != nil {
 			// No session cookie — try bearer token before redirecting.
 			if u, tokenScopes := s.bearerTokenUser(r); u != nil {
-				// Enforce read-only scope: block mutating methods.
-				if tokenScopes == models.TokenScopeReadOnly &&
-					r.Method != http.MethodGet && r.Method != http.MethodHead {
-					http.Error(w, "token scope is read-only", http.StatusForbidden)
+				// Enforce the token's scope on EVERY route (v2.57.1).
+				if msg := apiTokenScopeDenial(tokenScopes, r); msg != "" {
+					http.Error(w, msg, http.StatusForbidden)
 					return
 				}
 				ctx := context.WithValue(r.Context(), auth.ContextUserKey, u)
@@ -1024,10 +1102,9 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 			auth.ClearSessionCookie(w, r)
 			// Session invalid — try bearer token before redirecting.
 			if u, tokenScopes := s.bearerTokenUser(r); u != nil {
-				// Enforce read-only scope: block mutating methods.
-				if tokenScopes == models.TokenScopeReadOnly &&
-					r.Method != http.MethodGet && r.Method != http.MethodHead {
-					http.Error(w, "token scope is read-only", http.StatusForbidden)
+				// Enforce the token's scope on EVERY route (v2.57.1).
+				if msg := apiTokenScopeDenial(tokenScopes, r); msg != "" {
+					http.Error(w, msg, http.StatusForbidden)
 					return
 				}
 				ctx := context.WithValue(r.Context(), auth.ContextUserKey, u)
@@ -1038,43 +1115,31 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
-		// Enforce 2FA policy if enabled.
-		if !u.TOTPEnabled && currentAPITokenScope(r) == "" {
-			if v, _ := models.GetSetting(s.DB, settingRequire2FA); v == "1" {
-				path := r.URL.Path
-				// Review finding #9 (2026-10-04): /api/ used to be exempt
-				// here, so a session user who never enrolled TOTP could keep
-				// driving every JSON endpoint — the policy was advisory in
-				// practice. Answer API callers with JSON 403 rather than a
-				// redirect (a 303 would hand HTML to a fetch/JSON client),
-				// and keep the enrolment page + static assets reachable.
-				if strings.HasPrefix(path, "/api/") {
-					writeJSONError(w, http.StatusForbidden, "two-factor authentication enrolment is required")
-					return
-				}
-				if !strings.HasPrefix(path, "/totp/") && !strings.HasPrefix(path, "/static/") && path != "/logout" {
-					http.Redirect(w, r, "/totp/setup?required=1", http.StatusSeeOther)
-					return
-				}
+		// Enforce the two-factor policy: a user without TOTP goes to the setup
+		// page until they enrol.
+		//
+		// v2.64.1 (issue #138): this used to be two consecutive blocks, one per
+		// setting, which differed only in their query parameter and in what
+		// they let through — so whether an API call survived the redirect
+		// depended on which of two identically-described toggles the admin
+		// happened to use. One check now, with the wider exclusion list, and
+		// either setting still turns it on (see settingRequire2FA).
+		if !u.TOTPEnabled && s.twoFactorRequired() {
+			path := r.URL.Path
+			// Fork delta (review finding #9, 2026-10-04): upstream still excludes
+			// /api/ from this gate, so a session user who never enrolled TOTP
+			// keeps driving every JSON endpoint — writes included — while the
+			// policy claims otherwise. Answer JSON callers with a JSON 403: a 303
+			// hands HTML to a fetch/JSON client, which is why the hole was opened.
+			if strings.HasPrefix(path, "/api/") {
+				writeJSONError(w, http.StatusForbidden, "two-factor authentication enrolment is required")
+				return
 			}
-		}
-		// TOTP enforcement: if the admin has enabled require_totp and this user
-		// has TOTP disabled, redirect them to TOTP setup before granting access.
-		// Skip the check for the TOTP setup page itself to avoid a redirect loop.
-		if mustGetSetting(s.DB, settingRequireTOTP) == "1" && currentAPITokenScope(r) == "" {
-			if !u.TOTPEnabled {
-				// Allow /totp/setup and /logout through so the user can complete enrollment.
-				path := r.URL.Path
-				if strings.HasPrefix(path, "/api/") {
-					// Same reasoning as the require_2fa gate above: JSON callers
-					// get a JSON refusal, not a redirect into an HTML page.
-					writeJSONError(w, http.StatusForbidden, "two-factor authentication enrolment is required")
-					return
-				}
-				if path != "/totp/setup" && path != "/logout" && !strings.HasPrefix(path, "/static/") {
-					http.Redirect(w, r, "/totp/setup?enforce=1", http.StatusFound)
-					return
-				}
+			// /totp/ covers the setup page and its POST target, so enrolment
+			// can actually be completed.
+			if !strings.HasPrefix(path, "/totp/") && !strings.HasPrefix(path, "/static/") && path != "/logout" {
+				http.Redirect(w, r, "/totp/setup?required=1", http.StatusSeeOther)
+				return
 			}
 		}
 		ctx := context.WithValue(r.Context(), auth.ContextUserKey, u)
@@ -1145,6 +1210,18 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, name string, dat
 	}
 	// Always inject app version.
 	data["AppVersion"] = s.Version
+	// v2.62.0 (issue #128): the page's language and the strings the browser-side
+	// scripts may need (window.CADDYUI_I18N in layout.html).
+	if _, ok := data["Lang"]; !ok {
+		u, _ := data["User"].(*models.User)
+		if u == nil && r != nil {
+			u = s.currentUser(r)
+		}
+		data["Lang"] = s.requestLocale(r, u)
+	}
+	if _, ok := data["I18NJS"]; !ok {
+		data["I18NJS"] = translations().Subset(data["Lang"].(string), "js.")
+	}
 	// v2.29.0: CSRF token for every rendered page. CSRFField is the ready-made
 	// hidden input each POST form embeds; CSRFToken is the raw value, surfaced
 	// as a <meta> tag so the fetch wrapper in app.js can pick it up for JSON
@@ -1231,6 +1308,10 @@ func (s *Server) getSetup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) postSetup(w http.ResponseWriter, r *http.Request) {
+	// v2.57.1: the user-count check and the insert must be one step. Two
+	// simultaneous requests could both see zero users and both create an admin.
+	s.setupMu.Lock()
+	defer s.setupMu.Unlock()
 	n, err := models.CountUsers(s.DB)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1251,6 +1332,11 @@ func (s *Server) postSetup(w http.ResponseWriter, r *http.Request) {
 	}
 	if pw != pw2 {
 		s.render(w, r, "setup.html", map[string]any{"Error": "Passwords do not match"})
+		return
+	}
+	// The 8-character minimum was only an HTML attribute; enforce it here too.
+	if len(pw) < 8 {
+		s.render(w, r, "setup.html", map[string]any{"Error": "Password must be at least 8 characters"})
 		return
 	}
 	hash, err := auth.HashPassword(pw)
@@ -1292,7 +1378,7 @@ func (s *Server) getOnboarding(w http.ResponseWriter, r *http.Request) {
 	var proxyCount int
 	_ = s.DB.QueryRow(`SELECT COUNT(*) FROM proxy_hosts WHERE server_id = ?`, sid).Scan(&proxyCount)
 
-	completed := requiredReadinessSteps(serverConnected, cu.TOTPEnabled, proxyCount > 0)
+	completed := requiredReadinessSteps(serverConnected, proxyCount > 0)
 
 	s.render(w, r, "onboarding.html", map[string]any{
 		"User":            cu,
@@ -1327,6 +1413,15 @@ const (
 	// DoH URL (https://…/dns-query) or a comma-separated list of plain DNS
 	// servers (e.g. "192.168.1.10:53") for filtered/split-horizon networks.
 	settingDNSVerifyResolver = "dns_verify_resolver"
+
+	// issue #116: DNS servers Caddy's own ACME DNS-01 solver queries when
+	// checking TXT-record propagation during certificate issuance/renewal —
+	// distinct from settingDNSVerifyResolver, which only affects CaddyUI's
+	// deploy/readiness checks. Empty = Caddy's default (the container/system
+	// resolver), which fails for split-horizon DNS where the internal
+	// resolver can't see the public zone used for ACME validation. A
+	// comma-separated list of plain DNS servers, e.g. "1.1.1.1:53".
+	settingACMEDNSResolvers = "acme_dns_resolvers"
 
 	// Legacy alias kept so pre-v2.3.0 code paths referencing
 	// settingCFServerIP continue to compile. Points at the shared key.
@@ -2081,21 +2176,61 @@ func (s *Server) peerIsTrustedProxy(peerIP net.IP) bool {
 // wins; otherwise the right-most X-Forwarded-For entry is used, since that is
 // the hop appended by the closest trusted proxy and is not client-spoofable.
 func (s *Server) rateLimitClientIP(r *http.Request) string {
+	ip, _ := s.resolvedClientIP(r)
+	return ip
+}
+
+// resolvedClientIP returns the visitor's address as CaddyUI should judge it,
+// and whether that came from a proxy header rather than the connection.
+//
+// A forwarded header is believed only when the machine that opened the
+// connection is itself a trusted proxy, and the *right-most* entry is taken —
+// the one the trusted proxy appended — so a visitor cannot prepend a chosen
+// address to X-Forwarded-For and be believed.
+//
+// v2.65.0 (issue #140): split out of rateLimitClientIP so the admin IP
+// allowlist resolves the address the same way the login rate limiter does,
+// and so Settings can show the operator which address a request arrived with.
+func (s *Server) resolvedClientIP(r *http.Request) (ip string, viaTrustedProxy bool) {
 	peer := peerHost(r)
 	if s.peerIsTrustedProxy(net.ParseIP(peer)) {
 		if v := strings.TrimSpace(r.Header.Get("X-Real-Ip")); v != "" {
-			return v
+			return v, true
 		}
 		if v := r.Header.Get("X-Forwarded-For"); v != "" {
 			parts := strings.Split(v, ",")
 			for i := len(parts) - 1; i >= 0; i-- {
 				if p := strings.TrimSpace(parts[i]); p != "" {
-					return p
+					return p, true
 				}
 			}
 		}
 	}
-	return peer
+	return peer, false
+}
+
+// loginFailureWindow is how far back failed sign-in attempts are counted.
+const loginFailureWindow = 15 * time.Minute
+
+// maxTOTPAttemptsPerToken is how many wrong second-factor codes one pending
+// login token allows; maxTOTPFailuresPerAccount is how many wrong codes an
+// account may rack up inside loginFailureWindow, across tokens and IPs.
+const (
+	maxTOTPAttemptsPerToken   = 5
+	maxTOTPFailuresPerAccount = 10
+)
+
+// totpLockedOut reports whether an account has failed the second factor too
+// often recently. Keyed on the account, not the client IP, so it cannot lock out
+// everyone behind a shared reverse-proxy address; only someone who already
+// knows the password can trip it.
+func (s *Server) totpLockedOut(email string) bool {
+	var n int
+	_ = s.DB.QueryRow(
+		`SELECT COUNT(*) FROM activity_log WHERE action = 'login_totp_fail' AND actor = ? AND created_at > ?`,
+		email, time.Now().UTC().Add(-loginFailureWindow),
+	).Scan(&n)
+	return n >= maxTOTPFailuresPerAccount
 }
 
 func (s *Server) postLogin(w http.ResponseWriter, r *http.Request) {
@@ -2129,10 +2264,14 @@ func (s *Server) postLogin(w http.ResponseWriter, r *http.Request) {
 	if maxStr, _ := models.GetSetting(s.DB, settingMaxLoginAttempts); maxStr != "" {
 		if maxAttempts, err := strconv.Atoi(strings.TrimSpace(maxStr)); err == nil && maxAttempts > 0 {
 			var failCount int
+			// Security (v2.57.1): the failure row stores "ip:<addr>" in the
+			// target column (see LogActivity below). This query matched the
+			// detail column instead, so it always counted 0 and the lockout
+			// never fired.
 			_ = s.DB.QueryRow(
-				`SELECT COUNT(*) FROM activity_log WHERE action = 'login_fail' AND detail LIKE ? AND created_at > ?`,
-				"%ip:"+clientIP+"%",
-				time.Now().UTC().Add(-15*time.Minute),
+				`SELECT COUNT(*) FROM activity_log WHERE action = 'login_fail' AND target = ? AND created_at > ?`,
+				"ip:"+clientIP,
+				time.Now().UTC().Add(-loginFailureWindow),
 			).Scan(&failCount)
 			if failCount >= maxAttempts {
 				renderLoginErr("Too many failed login attempts. Please wait 15 minutes and try again.")
@@ -2150,6 +2289,10 @@ func (s *Server) postLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if u.TOTPEnabled && u.TOTPSecret != "" {
+		if s.totpLockedOut(u.Email) {
+			renderLoginErr("Too many failed verification attempts for this account. Please wait 15 minutes and try again.")
+			return
+		}
 		// Generate a pre-auth token and redirect to TOTP verification.
 		b := make([]byte, 16)
 		rand.Read(b)
@@ -2252,6 +2395,11 @@ func (s *Server) postTOTPVerify(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
+	if s.totpLockedOut(u.Email) {
+		s.pendingTOTPAttempts.Delete(tok)
+		renderTOTPErr("Too many failed verification attempts for this account. Please wait 15 minutes and sign in again.")
+		return
+	}
 
 	validTOTP := totplib.Validate(code, u.TOTPSecret)
 	if !validTOTP {
@@ -2263,12 +2411,21 @@ func (s *Server) postTOTPVerify(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !validTOTP {
+		// Security (v2.57.1): the token used to be put back after every wrong
+		// code with no limit, so a known password bought unlimited guesses at
+		// a 6-digit code. A token now allows maxTOTPAttemptsPerToken guesses,
+		// and an account that keeps failing is locked out (totpLockedOut) so a
+		// fresh password login cannot reset the budget.
+		attemptsAny, _ := s.pendingTOTPAttempts.LoadOrStore(tok, new(int32))
+		attempts := atomic.AddInt32(attemptsAny.(*int32), 1)
+		_ = models.LogActivity(s.DB, 0, u.Email, "login_totp_fail", "ip:"+clientIPFromRequest(r), "invalid TOTP code", false)
+		if attempts >= maxTOTPAttemptsPerToken {
+			s.pendingTOTPAttempts.Delete(tok) // the token stays deleted
+			renderTOTPErr("Too many incorrect codes. Please sign in again.")
+			return
+		}
 		// Put token back so user can retry.
 		s.pendingTOTP.Store(tok, userID)
-		// v2.9.210: log failed TOTP attempts for the same forensic reason
-		// as login_fail — repeated login_totp_fail rows from one IP signal
-		// somebody got past the password but is brute-forcing the 2FA code.
-		_ = models.LogActivity(s.DB, 0, u.Email, "login_totp_fail", "ip:"+clientIPFromRequest(r), "invalid TOTP code", false)
 		renderTOTPErr("Invalid code. Try again.")
 		return
 	}
@@ -2345,7 +2502,12 @@ func (s *Server) getTOTPSetup(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	pageError := ""
+	if r.URL.Query().Get("error") == "password" {
+		pageError = "Enter your current password to change two-factor settings."
+	}
 	s.render(w, r, "totp_setup.html", map[string]any{
+		"Error":           pageError,
 		"User":            u,
 		"Secret":          key.Secret(),
 		"OTPAuth":         key.URL(),
@@ -2359,12 +2521,32 @@ func (s *Server) getTOTPSetup(w http.ResponseWriter, r *http.Request) {
 }
 
 // postTOTPSetup enables or disables TOTP for the current user.
+// reauthenticated reports whether password is the signed-in user's current
+// password. Used before changing the second factor, so a stolen session alone
+// cannot remove it (v2.57.1).
+func (s *Server) reauthenticated(u *models.User, password string) bool {
+	if u == nil || password == "" {
+		return false
+	}
+	full, err := models.GetUserByID(s.DB, u.ID)
+	if err != nil || full == nil {
+		return false
+	}
+	return auth.CheckPassword(full.PasswordHash, password)
+}
+
 func (s *Server) postTOTPSetup(w http.ResponseWriter, r *http.Request) {
 	u := s.currentUser(r)
 	_ = r.ParseForm()
 	action := r.FormValue("action")
 
 	if action == "disable" {
+		// v2.57.1: re-authenticate. A stolen session could otherwise strip the
+		// account's second factor with one click.
+		if !s.reauthenticated(u, r.FormValue("current_password")) {
+			http.Redirect(w, r, "/totp/setup?error=password", http.StatusSeeOther)
+			return
+		}
 		if err := models.SetUserTOTP(s.DB, u.ID, "", false); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -2411,6 +2593,10 @@ func (s *Server) postRegenerateBackupCodes(w http.ResponseWriter, r *http.Reques
 		http.Redirect(w, r, "/totp/setup", http.StatusSeeOther)
 		return
 	}
+	if !s.reauthenticated(cu, r.FormValue("current_password")) { // v2.57.1 — see postTOTPSetup
+		http.Redirect(w, r, "/totp/setup?error=password", http.StatusSeeOther)
+		return
+	}
 	codes, err := models.GenerateBackupCodes(10)
 	if err != nil {
 		http.Error(w, "failed to generate codes", http.StatusInternalServerError)
@@ -2432,6 +2618,10 @@ type dashboardRecommendation struct {
 	Detail   string
 	URL      string
 	Action   string
+	// DismissURL, when set, renders a Dismiss button that POSTs here.
+	// v2.64.2 (issue #138): only for recommendations where declining is a
+	// legitimate decision rather than something left unfinished.
+	DismissURL string
 }
 
 type dashboardRecommendationInput struct {
@@ -2446,12 +2636,15 @@ type dashboardRecommendationInput struct {
 	DownCount         int
 	MaintenanceCount  int
 	GlobalMaintenance bool
-	Require2FA        bool
+	// v2.64.1 (issue #138): one policy, not two. See twoFactorRequired.
 	RequireTOTP       bool
 	AdminAllowlistSet bool
 	AutoSnapshots     bool
 	DismissedUnused   string
-	Now               time.Time
+	// v2.64.2 (issue #138): admin acknowledged that they do not want a
+	// site-wide TOTP requirement.
+	DismissedTOTPPolicy bool
+	Now                 time.Time
 	// v2.39.0: best-known expiry per custom certificate (stored PEM, readable
 	// file, or the last live TLS probe) — see customCertificateExpiries.
 	// Callers that leave it nil still get stored-PEM expiries.
@@ -2472,6 +2665,12 @@ func buildDashboardRecommendations(in dashboardRecommendationInput) []dashboardR
 			URL:      url,
 			Action:   action,
 		})
+	}
+	// addDismissible is add() for a recommendation the admin may legitimately
+	// decline. Same append path, so the cap below still applies to it.
+	addDismissible := func(severity, title, detail, url, action, dismissURL string) {
+		add(severity, title, detail, url, action)
+		out[len(out)-1].DismissURL = dismissURL
 	}
 
 	if in.GlobalMaintenance {
@@ -2575,8 +2774,19 @@ func buildDashboardRecommendations(in dashboardRecommendationInput) []dashboardR
 	}
 
 	if in.IsAdmin {
-		if !in.Require2FA && !in.RequireTOTP {
-			add("warning", "2FA is not required", "Admins can enable required TOTP enrollment to reduce account-takeover risk.", "/settings/security", "Open security")
+		// v2.64.2 (issue #138): deciding against a site-wide TOTP requirement
+		// is a legitimate choice, so this one can be acknowledged. The
+		// dismissal is cleared the moment the policy is turned on and off
+		// again, so it cannot hide a later change of mind.
+		if !in.RequireTOTP && !in.DismissedTOTPPolicy {
+			addDismissible(
+				"warning",
+				"Two-factor authentication is not required",
+				"Requiring TOTP enrolment for everyone reduces account-takeover risk. Dismiss this if you have decided against it.",
+				"/settings/security",
+				"Open security",
+				"/dashboard/recommendations/two-factor-policy/dismiss",
+			)
 		}
 		if !in.AdminAllowlistSet {
 			add("info", "Admin IP allowlist is empty", "Restricting CaddyUI to trusted IPs or CIDRs can reduce exposure for homelab installs.", "/settings/security", "Open security")
@@ -2775,6 +2985,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	// landing on the dashboard see at a glance what just changed.
 	var recentEdits []models.Activity
 	if all, err := models.ListActivity(s.DB, sid, 60); err == nil {
+		all = s.activityVisibleTo(s.currentUser(r), all) // v2.57.1
 		for _, a := range all {
 			if !a.Success {
 				continue
@@ -2795,32 +3006,35 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	currentServer, _ := models.GetCaddyServer(s.DB, sid)
 	serverReady := currentServer != nil && currentServer.Status == models.CaddyServerStatusOnline
-	readinessSteps := requiredReadinessSteps(serverReady, cu != nil && cu.TOTPEnabled, len(hosts) > 0)
-	showReadiness := isAdmin && (!serverReady || len(hosts) == 0 || cu == nil || !cu.TOTPEnabled)
+	readinessSteps := requiredReadinessSteps(serverReady, len(hosts) > 0)
+	// v2.64.2 (issue #138): the banner clears once the required foundations
+	// are in place. It used to also hang on the admin's own TOTP, which is a
+	// recommendation, so declining it meant "Continue setup" with nothing
+	// left to continue.
+	showReadiness := isAdmin && readinessIncomplete(serverReady, len(hosts) > 0)
 	snapshots, _ := models.ListSnapshots(s.DB, sid, 1)
-	require2FA := mustGetSetting(s.DB, settingRequire2FA) == "1"
-	requireTOTP := mustGetSetting(s.DB, settingRequireTOTP) == "1"
+	requireTOTP := s.twoFactorRequired()
 	adminAllowlistSet := strings.TrimSpace(mustGetSetting(s.DB, settingAdminAllowlist)) != ""
 	dismissedUnused := mustGetSetting(s.DB, unusedCertificateDismissalKey(sid))
 	recommendations := buildDashboardRecommendations(dashboardRecommendationInput{
-		IsAdmin:           isAdmin,
-		ProxyHosts:        hosts,
-		RedirectionHosts:  redirs,
-		RawRoutes:         raws,
-		Certificates:      certs,
-		Snapshots:         snapshots,
-		DNSProfileIDs:     dnsProfileIDs,
-		LastSync:          lastSync,
-		DownCount:         downCount,
-		MaintenanceCount:  maintenanceCount,
-		GlobalMaintenance: globalMaintenance == "1",
-		Require2FA:        require2FA,
-		RequireTOTP:       requireTOTP,
-		AdminAllowlistSet: adminAllowlistSet,
-		AutoSnapshots:     s.autoSnapshotsEnabled(),
-		DismissedUnused:   dismissedUnused,
-		CertificateExpiry: s.customCertificateExpiries(certs),
-		Now:               time.Now(),
+		IsAdmin:             isAdmin,
+		ProxyHosts:          hosts,
+		RedirectionHosts:    redirs,
+		RawRoutes:           raws,
+		Certificates:        certs,
+		Snapshots:           snapshots,
+		DNSProfileIDs:       dnsProfileIDs,
+		LastSync:            lastSync,
+		DownCount:           downCount,
+		MaintenanceCount:    maintenanceCount,
+		GlobalMaintenance:   globalMaintenance == "1",
+		RequireTOTP:         requireTOTP,
+		AdminAllowlistSet:   adminAllowlistSet,
+		AutoSnapshots:       s.autoSnapshotsEnabled(),
+		DismissedUnused:     dismissedUnused,
+		DismissedTOTPPolicy: mustGetSetting(s.DB, settingTOTPPolicyDismissed) == "1",
+		CertificateExpiry:   s.customCertificateExpiries(certs),
+		Now:                 time.Now(),
 	})
 
 	s.render(w, r, "dashboard.html", map[string]any{
@@ -3033,7 +3247,7 @@ func (s *Server) createRedirectionHost(w http.ResponseWriter, r *http.Request) {
 		s.renderRedirectionHostFormError(w, r, rh, errMsg)
 		return
 	}
-	deployTo := parseDeployTo(r)
+	deployTo := s.effectiveDeployTargets(s.currentServerID(r), parseDeployTo(r))
 	cu := s.currentUser(r)
 	var rhOwnerID int64
 	if cu != nil && cu.Role != models.RoleAdmin {
@@ -3047,6 +3261,10 @@ func (s *Server) createRedirectionHost(w http.ResponseWriter, r *http.Request) {
 				rhOwnerID = parsed
 			}
 		}
+	}
+	if errMsg := s.validateRedirectionForUser(s.currentUser(r), rh); errMsg != "" { // v2.57.1
+		s.renderRedirectionHostFormError(w, r, rh, errMsg)
+		return
 	}
 	if errMsg := s.previewRedirectValidate(s.currentServerID(r), rh); errMsg != "" { // v2.42.1 (issue #74)
 		s.renderRedirectionHostFormError(w, r, rh, errMsg)
@@ -3136,13 +3354,17 @@ func (s *Server) updateRedirectionHost(w http.ResponseWriter, r *http.Request) {
 		s.renderRedirectionHostFormError(w, r, rh, errMsg)
 		return
 	}
-	deployTo := parseDeployTo(r)
+	deployTo := s.effectiveDeployTargets(s.currentServerID(r), parseDeployTo(r))
 	old, _ := models.GetRedirectionHost(s.DB, id)
 	// v2.12.2: preserve existing record IDs across UPDATE so delete-on-change
 	// still has them. parseRedirectionHostForm doesn't carry DNSRecordID
 	// (the form has no hidden field for it — same as proxy hosts).
 	if old != nil {
 		rh.DNSRecordID = old.DNSRecordID
+	}
+	if errMsg := s.validateRedirectionForUser(s.currentUser(r), rh); errMsg != "" { // v2.57.1
+		s.renderRedirectionHostFormError(w, r, rh, errMsg)
+		return
 	}
 	if errMsg := s.previewRedirectValidate(s.currentServerID(r), rh); errMsg != "" { // v2.42.1 (issue #74)
 		s.renderRedirectionHostFormError(w, r, rh, errMsg)
@@ -3203,6 +3425,10 @@ func (s *Server) deleteRedirectionHost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	note := s.noteFleetDeletion(models.FleetResourceRedirect, id, "")
+	if old != nil {
+		note.label = old.Domains
+	}
 	if err := models.DeleteRedirectionHost(s.DB, id); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -3213,7 +3439,8 @@ func (s *Server) deleteRedirectionHost(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = models.LogActivity(s.DB, s.currentServerID(r), s.currentUserEmail(r), "redirect_delete", fmt.Sprintf("redirect:%d", id), "", true)
 	forceTLS := old != nil && old.CertificateID != 0
-	s.trySyncCaddy(s.currentServerID(r), forceTLS)
+	s.trySyncCaddyAfterDelete(s.currentServerID(r), forceTLS)
+	s.propagateNotedDeletion(s.currentUserEmail(r), note) // v2.59.0 (issue #120)
 	http.Redirect(w, r, "/redirection-hosts", http.StatusSeeOther)
 }
 
@@ -3228,6 +3455,13 @@ func (s *Server) cloneRedirectionHost(w http.ResponseWriter, r *http.Request) {
 	src, err := models.GetRedirectionHost(s.DB, id)
 	if err != nil || src == nil {
 		http.NotFound(w, r)
+		return
+	}
+	// Same gap as cloneProxyHost: without this, a non-admin could clone (and
+	// thereby read the configuration of) any other tenant's or the admin's
+	// redirection host by guessing its ID.
+	if !s.canManageOwned(s.currentUser(r), src.OwnerID) {
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	// Append "(copy)" to each domain.
@@ -3338,11 +3572,24 @@ func (s *Server) postImport(w http.ResponseWriter, r *http.Request) {
 		return true
 	}
 
-	// Import always creates global/admin-owned resources (ownerID=0).
+	// Import always creates global/admin-owned resources (ownerID=0), but the
+	// account TRIGGERING the import can be any write-capable role — GHSA-r4wm-rgc5-q834
+	// (3rd finding) follow-up: the pulled-in config's ForwardHost/ForwardPort
+	// are attacker-controlled from that account's perspective (a non-admin
+	// could point Caddy's own admin API at itself via a crafted upstream
+	// Caddy config), so the same non-admin upstream guard applies here too.
+	// cu, not the resulting ownerID=0, is what the guard checks.
+	cu := s.currentUser(r)
 	nProxy, nRedir, nRaw := 0, 0, 0
 	for i := range result.Proxies {
 		p := result.Proxies[i]
 		if !claim(p.DomainList()) {
+			continue
+		}
+		if msg := s.validateProxyUpstreamsForUser(cu, &p); msg != "" {
+			// The reason (msg) is derived from a route that carries header and
+			// API-key values, so it is deliberately not written to the log.
+			log.Printf("import: skipped proxy host %q: refused by the non-admin upstream guard", p.Domains)
 			continue
 		}
 		if _, err := models.CreateProxyHost(s.DB, s.currentServerID(r), 0, &p); err == nil {
@@ -3429,29 +3676,8 @@ func (s *Server) postCaddyfileImport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Auto-load snippet definitions from the mounted Caddyfile so users can use
-	// `import <name>` without pasting the definition. We only prepend the
-	// snippet blocks themselves — never site blocks or the global options block,
-	// which would duplicate existing routes or clash with Caddy's single global
-	// options restriction. Snippets the user already redefined in the paste are
-	// skipped to avoid Caddy's duplicate-definition error.
-	var loadedSnippets []string
-	if s.CaddyfilePath != "" {
-		if b, err := os.ReadFile(s.CaddyfilePath); err == nil {
-			already := map[string]bool{}
-			for _, snip := range caddy.ExtractSnippets(src) {
-				already[caddy.HeadOfBlock(snip)] = true
-			}
-			for _, snip := range caddy.ExtractSnippets(string(b)) {
-				if !already[caddy.HeadOfBlock(snip)] {
-					loadedSnippets = append(loadedSnippets, snip)
-				}
-			}
-		}
-	}
-	fullPaste := src
-	if len(loadedSnippets) > 0 {
-		fullPaste = strings.Join(loadedSnippets, "\n\n") + "\n\n" + src
-	}
+	// `import <name>` without pasting the definition (see withAutoLoadedSnippets).
+	fullPaste := s.withAutoLoadedSnippets(src)
 
 	// Adapt the ENTIRE paste as a single unit so cross-block references work:
 	// `import <snippet>` must see `(<snippet>) { ... }` defined in the same paste,
@@ -3612,6 +3838,17 @@ func (s *Server) postCaddyfileImport(w http.ResponseWriter, r *http.Request) {
 			if len(classified.Proxies) == 1 {
 				ph := classified.Proxies[0]
 				ph.Enabled = true
+				// GHSA-r4wm-rgc5-q834 (3rd finding) follow-up: ph.ForwardHost
+				// comes straight from the pasted Caddyfile block, so it needs
+				// the same non-admin upstream guard the REST/form create
+				// paths already enforce.
+				if msg := s.validateProxyUpstreamsForUser(cu, &ph); msg != "" {
+					results = append(results, caddyfileImportResult{
+						Head: label, Snippet: blockText, RouteIdx: idx,
+						Status: "error", Message: msg,
+					})
+					continue
+				}
 				id, err := models.CreateProxyHost(s.DB, s.currentServerID(r), ownerID, &ph)
 				if err != nil {
 					results = append(results, caddyfileImportResult{
@@ -3850,6 +4087,64 @@ func extractAdaptedAutomationPolicies(cfg map[string]any) []map[string]any {
 	return out
 }
 
+// adaptedClientAuthSNIs returns the SNIs of every adapted TLS connection
+// policy that asks the client for a certificate.
+//
+// v2.64.0 (discussion #137): `tls { client_auth ... }` in a site block does
+// not adapt to anything inside the route — it becomes a
+// tls_connection_policies entry, and route-only importers keep just the
+// routes. The block therefore vanished without a word, and the site came up
+// looking configured while accepting anyone. Callers use this to say so
+// instead, and point at the per-host setting that does reach Caddy.
+func adaptedClientAuthSNIs(cfg map[string]any) []string {
+	apps, _ := cfg["apps"].(map[string]any)
+	httpApp, _ := apps["http"].(map[string]any)
+	servers, _ := httpApp["servers"].(map[string]any)
+	var out []string
+	seen := map[string]bool{}
+	for _, srv := range servers {
+		m, _ := srv.(map[string]any)
+		policies, _ := m["tls_connection_policies"].([]any)
+		for _, p := range policies {
+			pm, _ := p.(map[string]any)
+			if _, ok := pm["client_authentication"]; !ok {
+				continue
+			}
+			match, _ := pm["match"].(map[string]any)
+			snis, _ := match["sni"].([]any)
+			if len(snis) == 0 {
+				// A policy with no SNI match applies to every name the
+				// server serves; name it so the message still says something.
+				if !seen["(all hostnames)"] {
+					seen["(all hostnames)"] = true
+					out = append(out, "(all hostnames)")
+				}
+				continue
+			}
+			for _, s := range snis {
+				if str, ok := s.(string); ok && !seen[str] {
+					seen[str] = true
+					out = append(out, str)
+				}
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// extractAdaptedLayer4App pulls apps.layer4 from an adapted Caddy config —
+// and only that key. v2.56.0 (issue #113): a pasted layer4 Caddyfile block is
+// adapted in isolation via buildLayer4App, and the result is trusted only for
+// this one subtree; any other top-level key the adapter happens to emit
+// (e.g. a stray "admin" or "apps.http" from unrelated pasted syntax) is
+// discarded rather than merged into the config CaddyUI pushes.
+func extractAdaptedLayer4App(cfg map[string]any) map[string]any {
+	apps, _ := cfg["apps"].(map[string]any)
+	layer4, _ := apps["layer4"].(map[string]any)
+	return layer4
+}
+
 // mergeAutomationPolicies makes incoming subject-scoped policies authoritative
 // for those subjects while preserving unrelated and catch-all live policies.
 // This is reconciliation rather than append-only merging: changing a Managed
@@ -3983,6 +4278,14 @@ func (s *Server) buildDNSAutomationPolicies(proxies []models.ProxyHost, redirs [
 		}
 	}
 
+	// issue #116: optional DNS servers for Caddy's own ACME DNS-01 TXT-record
+	// propagation checks (split-horizon DNS). Resolved once and applied to
+	// every provider bucket below.
+	var resolvers []any
+	for _, r := range s.acmeDNSResolvers() {
+		resolvers = append(resolvers, r)
+	}
+
 	var policies []map[string]any
 	for _, b := range byProvider {
 		if len(b.subjects) == 0 {
@@ -3998,14 +4301,16 @@ func (s *Server) buildDNSAutomationPolicies(proxies []models.ProxyHost, redirs [
 		for _, s := range b.subjects {
 			subj = append(subj, s)
 		}
+		dnsChallenge := map[string]any{"provider": cfg}
+		if len(resolvers) > 0 {
+			dnsChallenge["resolvers"] = resolvers
+		}
 		policies = append(policies, map[string]any{
 			"subjects": subj,
 			"issuers": []any{map[string]any{
 				"module": "acme",
 				"challenges": map[string]any{
-					"dns": map[string]any{
-						"provider": cfg,
-					},
+					"dns": dnsChallenge,
 				},
 			}},
 		})
@@ -4051,7 +4356,10 @@ func buildInternalTLSAutomationPolicies(proxies []models.ProxyHost) []map[string
 // These 404 fallbacks are appended after real routes, so an actual proxy or
 // redirect for the same hostname wins while otherwise-unhandled wildcard
 // traffic fails closed.
-func buildManagedCertificateRoutes(certs []models.Certificate) []any {
+func buildManagedCertificateRoutes(certs []models.Certificate, fallbackHandle []any) []any {
+	if len(fallbackHandle) == 0 {
+		fallbackHandle = []any{map[string]any{"handler": "static_response", "status_code": 404}}
+	}
 	var routes []any
 	for _, cert := range certs {
 		if cert.Source != models.CertSourceManaged {
@@ -4071,11 +4379,8 @@ func buildManagedCertificateRoutes(certs []models.Certificate) []any {
 			continue
 		}
 		routes = append(routes, map[string]any{
-			"match": []any{map[string]any{"host": hostValues}},
-			"handle": []any{map[string]any{
-				"handler":     "static_response",
-				"status_code": 404,
-			}},
+			"match":    []any{map[string]any{"host": hostValues}},
+			"handle":   fallbackHandle, // same answer as any other unknown host (issue #123)
 			"terminal": true,
 		})
 	}
@@ -4219,6 +4524,26 @@ func pushAutomationPoliciesVia(cl *caddy.Client, incoming []map[string]any) erro
 	return cl.PutPath("/config/apps/tls/automation", automation)
 }
 
+// settingTOTPPolicyDismissed records that an admin has acknowledged the
+// dashboard's "two-factor authentication is not required" recommendation.
+//
+// v2.64.2 (issue #138): not requiring site-wide TOTP is a valid decision, and
+// a recommendation that cannot be acknowledged is a permanent nag. Cleared
+// whenever the policy is switched on, so turning it off later raises the
+// recommendation again rather than staying silently dismissed from months ago.
+const settingTOTPPolicyDismissed = "dashboard_totp_policy_dismissed"
+
+// twoFactorRequired reports whether every user must enrol TOTP before reaching
+// a protected page.
+//
+// v2.64.1 (issue #138): true when either key is set. The two were separate
+// toggles doing the same job; collapsing them to one must not switch the
+// policy off for an install that had set only the older of the pair.
+func (s *Server) twoFactorRequired() bool {
+	return mustGetSetting(s.DB, settingRequireTOTP) == "1" ||
+		mustGetSetting(s.DB, settingRequire2FA) == "1"
+}
+
 // --- Snapshots ---
 
 // settingAutoSnapshots gates creation of "auto" snapshots (pre-sync, pre-restore).
@@ -4226,12 +4551,24 @@ func pushAutomationPoliciesVia(cl *caddy.Client, incoming []map[string]any) erro
 // don't want a snapshot every sync filling the DB.
 const settingAutoSnapshots = "auto_snapshots_enabled"
 
-// settingRequire2FA gates 2FA enforcement: when "1", users without TOTP enabled
-// are redirected to /totp/setup before accessing any page.
-const settingRequire2FA = "require_2fa"
-
-// settingRequireTOTP forces all users to enroll TOTP before accessing protected pages.
+// settingRequireTOTP forces every user to enrol TOTP before reaching any
+// protected page. This is the canonical key for the policy.
 const settingRequireTOTP = "require_totp"
+
+// settingRequire2FA is the deprecated twin of settingRequireTOTP.
+//
+// v2.64.1 (issue #138): CaddyUI shipped two settings for one policy — both
+// enforced "enrol TOTP or go to the setup page", and their descriptions on
+// Settings › Security said nearly the same thing, so nobody could tell which
+// to use. The UI now has one toggle.
+//
+// The key is kept, and written in lockstep with settingRequireTOTP, for one
+// reason: an install that had only this one switched on must not quietly stop
+// enforcing two-factor auth, in either direction. Reading honours whichever
+// key is set (twoFactorRequired), and saving sets both, so downgrading to a
+// release that reads only this key still enforces the policy. Don't add new
+// reads of it.
+const settingRequire2FA = "require_2fa"
 
 // settingSessionDays is the admin-configured session lifetime in days.
 // Default is 7 days when empty or invalid.
@@ -4241,6 +4578,35 @@ const settingSessionDays = "session_duration_days"
 // appended last in the merged Caddy config so it fires only when no
 // proxy/redirect/raw route matched.
 const settingCatchAll404HTML = "catch_all_404_html"
+
+// settingFallbackStatus is the HTTP status answered for a request that matches
+// no proxy host, redirection or Advanced route (v2.60.0, issue #123). Empty =
+// 404. Applies to the HTTP and HTTPS servers alike, and to the managed
+// wildcard-certificate route, so every kind of unknown host behaves the same.
+const settingFallbackStatus = "fallback_status_code"
+
+// defaultFallbackStatus is used when nothing is configured or the stored value
+// is not a usable 4xx/5xx code.
+const defaultFallbackStatus = 404
+
+// parseFallbackStatus accepts an error status in the 4xx/5xx range. ok is false
+// for anything else (including blank, which callers treat as "use the default").
+func parseFallbackStatus(raw string) (code int, ok bool) {
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || n < 400 || n > 599 {
+		return 0, false
+	}
+	return n, true
+}
+
+// fallbackStatusCode is the configured fallback status, or 404.
+func (s *Server) fallbackStatusCode() int {
+	raw, _ := models.GetSetting(s.DB, settingFallbackStatus)
+	if n, ok := parseFallbackStatus(raw); ok {
+		return n
+	}
+	return defaultFallbackStatus
+}
 
 // settingGlobalMaintenance puts ALL proxy hosts into maintenance mode when "1".
 // A catch-all 503 route is prepended to the Caddy routes list so every request
@@ -4270,6 +4636,40 @@ const settingFaviconURL = "favicon_url"
 // settingAdminAllowlist holds newline or comma-separated IPs/CIDRs that are
 // permitted to access the CaddyUI admin panel. When empty, all IPs are allowed.
 const settingAdminAllowlist = "admin_allowlist"
+
+// envAdminAllowlist overrides settingAdminAllowlist from the environment.
+//
+// v2.65.0 (issue #140): an allowlist that turns out not to include you locks
+// you out of the only page that could fix it, and the reporter hit exactly
+// that. Setting this in docker-compose takes precedence over the stored
+// value, so recovery is a compose edit and a restart rather than hand-editing
+// SQLite. `CADDYUI_ADMIN_ALLOWLIST=""` is treated as "not set"; use
+// `CADDYUI_ADMIN_ALLOWLIST=off` to disable the gate entirely while you get
+// back in. The stored setting is left untouched either way, so removing the
+// variable restores whatever was configured.
+const envAdminAllowlist = "CADDYUI_ADMIN_ALLOWLIST"
+
+// adminAllowlist returns the effective allowlist: the environment override
+// when present, otherwise the stored setting. An override of "off"/"none"/
+// "any" (any case) returns empty, which adminIPGate treats as "allow all".
+func (s *Server) adminAllowlist() string {
+	if env := strings.TrimSpace(os.Getenv(envAdminAllowlist)); env != "" {
+		switch strings.ToLower(env) {
+		case "off", "none", "any", "*":
+			return ""
+		}
+		return env
+	}
+	raw, _ := models.GetSetting(s.DB, settingAdminAllowlist)
+	return raw
+}
+
+// adminAllowlistFromEnv reports whether the environment is currently
+// overriding the stored allowlist, so Settings can say so rather than showing
+// a stored value that is not in force.
+func (s *Server) adminAllowlistFromEnv() bool {
+	return strings.TrimSpace(os.Getenv(envAdminAllowlist)) != ""
+}
 
 // settingGlobalIPBlocklist holds newline or comma-separated IPs/CIDRs blocked
 // across every host (v2.50.0, issue #100). Applied as a top-level 403 route on
@@ -4347,10 +4747,26 @@ func (s *Server) currentServerID(r *http.Request) int64 {
 // Credentials (if set on the server row) are threaded into the client so
 // admins can lock the admin API behind HTTP Basic Auth via a reverse proxy.
 func (s *Server) caddyForRequest(r *http.Request) *caddy.Client {
+	var cl *caddy.Client
 	if srv, err := models.GetCaddyServer(s.DB, s.currentServerID(r)); err == nil {
-		return caddy.New(srv.AdminURL, srv.AdminUsername, srv.AdminPassword)
+		cl = caddy.New(srv.AdminURL, srv.AdminUsername, srv.AdminPassword)
+	} else {
+		cl = s.Caddy
 	}
-	return s.Caddy
+	// v2.57.1: for a non-admin's request, refuse Caddyfile text that reads the
+	// Caddy server's environment or files BEFORE it is adapted (see
+	// Client.AdaptTextCheck). Copy first — s.Caddy is shared.
+	if cl != nil && !isAdminUser(s.currentUser(r)) {
+		cp := *cl
+		cp.AdaptTextCheck = func(text string) string {
+			if why := tenantTextViolation(text); why != "" {
+				return "Not allowed for a non-admin account: " + why + ". Ask an administrator."
+			}
+			return ""
+		}
+		return &cp
+	}
+	return cl
 }
 
 // caddyForServer returns a Caddy client for an explicit server ID.
@@ -4628,6 +5044,27 @@ func (s *Server) getAPIDocs(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// activityVisibleTo scopes activity-log entries to what the user may see: an
+// admin sees all of them; anyone else sees only their own actions. The log
+// records every account's edits (other tenants' domains), failed logins with the
+// submitted email, and the admin's sign-in IP addresses — none of which a
+// customer or read-only account should read (v2.57.1).
+func (s *Server) activityVisibleTo(u *models.User, entries []models.Activity) []models.Activity {
+	if isAdminUser(u) {
+		return entries
+	}
+	if u == nil {
+		return nil
+	}
+	out := entries[:0:0]
+	for _, a := range entries {
+		if strings.EqualFold(a.Actor, u.Email) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
 func (s *Server) listActivityLog(w http.ResponseWriter, r *http.Request) {
 	search := strings.TrimSpace(r.URL.Query().Get("search"))
 	actionFilter := strings.TrimSpace(r.URL.Query().Get("action"))
@@ -4636,6 +5073,7 @@ func (s *Server) listActivityLog(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	entries = s.activityVisibleTo(s.currentUser(r), entries) // v2.57.1
 	if actionFilter != "" {
 		filtered := entries[:0]
 		for _, a := range entries {
@@ -4654,6 +5092,19 @@ func (s *Server) listActivityLog(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// csvSafe neutralises spreadsheet formula injection in an exported cell: a
+// value that starts with = + - @ (or a tab / carriage return, which Excel also
+// treats as a formula lead-in) is prefixed with an apostrophe so it opens as
+// text. Values come from places anyone can write — an unauthenticated failed
+// login records the submitted email as the actor, and a visitor controls the
+// path and User-Agent of every request (v2.57.1).
+func csvSafe(v string) string {
+	if v != "" && strings.ContainsRune("=+-@\t\r", rune(v[0])) {
+		return "'" + v
+	}
+	return v
+}
+
 func (s *Server) exportActivityCSV(w http.ResponseWriter, r *http.Request) {
 	cu := s.currentUser(r)
 	if cu == nil {
@@ -4667,6 +5118,7 @@ func (s *Server) exportActivityCSV(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	entries = s.activityVisibleTo(cu, entries) // v2.57.1
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="activity.csv"`)
 	cw := csv.NewWriter(w)
@@ -4678,10 +5130,10 @@ func (s *Server) exportActivityCSV(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = cw.Write([]string{
 			strconv.FormatInt(a.ID, 10),
-			a.Actor,
-			a.Action,
-			a.Target,
-			a.Detail,
+			csvSafe(a.Actor),
+			csvSafe(a.Action),
+			csvSafe(a.Target),
+			csvSafe(a.Detail),
 			succ,
 			a.CreatedAt.Format(time.RFC3339),
 		})
@@ -4690,6 +5142,44 @@ func (s *Server) exportActivityCSV(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- build helpers ---
+
+// fallbackRoute is the route that answers a request no proxy host, redirection
+// or Advanced route matched. The status is configurable (v2.60.0, issue #123). v2.59.4 (issue #123): without one Caddy answers an
+// unknown hostname with an EMPTY 200 OK, and CaddyUI generated one only when the
+// admin had saved custom 404 HTML, so by default an unknown host got 200 on both
+// listeners. It is now always a real 404 — the admin's HTML when configured,
+// otherwise Caddy's error handler (which renders CaddyUI's branded 404 page on
+// the HTTPS server, where the error routes live).
+func (s *Server) fallbackRoute() map[string]any {
+	status := s.fallbackStatusCode()
+	if html, _ := models.GetSetting(s.DB, settingCatchAll404HTML); strings.TrimSpace(html) != "" {
+		return map[string]any{
+			"handle": []any{map[string]any{
+				"handler":     "static_response",
+				"status_code": status,
+				"headers": map[string]any{
+					"Content-Type": []any{"text/html; charset=utf-8"},
+				},
+				"body": html,
+			}},
+			"terminal": true,
+		}
+	}
+	return map[string]any{
+		"handle":   []any{map[string]any{"handler": "error", "status_code": status}},
+		"terminal": true,
+	}
+}
+
+// withFallbackRoute appends the fallback as the LAST route. A server that has no
+// routes at all is left alone: CaddyUI then owns nothing on that listener, and
+// an empty list must keep meaning "do not take over".
+func (s *Server) withFallbackRoute(routes []any) []any {
+	if len(routes) == 0 {
+		return routes
+	}
+	return append(routes, s.fallbackRoute())
+}
 
 func (s *Server) buildMergedRoutes(proxies []models.ProxyHost, redirs []models.RedirectionHost, raws []models.RawRoute) []any {
 	routes := []any{}
@@ -4712,7 +5202,11 @@ func (s *Server) buildMergedRoutes(proxies []models.ProxyHost, redirs []models.R
 		}
 		var advanced []any
 		var advancedOverrides map[string]any
-		if strings.TrimSpace(p.AdvancedConfig) != "" {
+		if strings.TrimSpace(p.AdvancedConfig) != "" && s.isTenantOwner(p.OwnerID) && tenantTextViolation(p.AdvancedConfig) != "" {
+			// {$ENV} is substituted by Caddy while ADAPTING, so the value would
+			// already be baked into the handlers; refuse before adapting.
+			log.Printf("caddy sync: proxy id=%d advanced_config skipped, not allowed for a non-admin owner: %s", p.ID, tenantTextViolation(p.AdvancedConfig))
+		} else if strings.TrimSpace(p.AdvancedConfig) != "" {
 			h, overrides, err := s.adaptProxyAdvanced(p)
 			if err != nil {
 				// Don't fail the whole sync — log and push the route without advanced
@@ -4725,13 +5219,19 @@ func (s *Server) buildMergedRoutes(proxies []models.ProxyHost, redirs []models.R
 		}
 		route := caddy.BuildProxyRoute(p, append(preHandlers, advanced...))
 		caddy.MergeReverseProxyOverrides(route, advancedOverrides)
-		routes = append(routes, route)
+		// v2.57.1: enforcement point for routes owned by a non-admin — see
+		// tenant_guard.go. Admin-owned routes pass through untouched.
+		if safe, ok := s.sanitizeTenantRoute(p.OwnerID, "proxy host "+p.Domains, route); ok {
+			routes = append(routes, safe)
+		}
 	}
 	for _, rd := range redirs {
 		if !rd.Enabled || len(rd.DomainList()) == 0 {
 			continue
 		}
-		routes = append(routes, caddy.BuildRedirectRoute(rd))
+		if safe, ok := s.sanitizeTenantRoute(rd.OwnerID, "redirection "+rd.Domains, caddy.BuildRedirectRoute(rd)); ok {
+			routes = append(routes, safe)
+		}
 	}
 	for _, rr := range raws {
 		if !rr.Enabled {
@@ -4742,25 +5242,12 @@ func (s *Server) buildMergedRoutes(proxies []models.ProxyHost, redirs []models.R
 		if rr.Listen != "" {
 			continue
 		}
-		routes = append(routes, rawRouteEntries(rr)...)
+		routes = append(routes, s.tenantSafeRawEntries(rr)...)
 	}
 
-	// Append a catch-all 404 route when the admin has configured custom HTML.
-	// This appears last so it only fires for requests that didn't match any
-	// proxy/redirect/raw route above.
-	if html, _ := models.GetSetting(s.DB, settingCatchAll404HTML); strings.TrimSpace(html) != "" {
-		routes = append(routes, map[string]any{
-			"handle": []any{map[string]any{
-				"handler":     "static_response",
-				"status_code": 404,
-				"headers": map[string]any{
-					"Content-Type": []any{"text/html; charset=utf-8"},
-				},
-				"body": html,
-			}},
-			"terminal": true,
-		})
-	}
+	// v2.61.3 (issue #129): exact hostnames before wildcards, so a wildcard host
+	// can never take over a more specific host's route (and skip its allowlist).
+	routes = sortRoutesBySpecificity(routes)
 
 	// Global maintenance mode: prepend a catch-all 503 before all routes so
 	// every incoming request receives the maintenance page regardless of which
@@ -5042,6 +5529,22 @@ func applyPlainHTTPServer(cfg map[string]any, routes []any) {
 // may hold a single route object or an array of routes; arrays are spread so
 // we never emit a nested array (which Caddy rejects). Shared by srv0 assembly
 // and by the per-port servers of v2.36.1 (issue #64).
+// tenantSafeRawEntries is rawRouteEntries with the non-admin enforcement of
+// tenant_guard.go applied to each entry (v2.57.1).
+func (s *Server) tenantSafeRawEntries(rr models.RawRoute) []any {
+	entries := rawRouteEntries(rr)
+	if !s.isTenantOwner(rr.OwnerID) {
+		return entries
+	}
+	out := make([]any, 0, len(entries))
+	for _, e := range entries {
+		if safe, ok := s.sanitizeTenantRoute(rr.OwnerID, "advanced route "+rr.Label, e); ok {
+			out = append(out, safe)
+		}
+	}
+	return out
+}
+
 func rawRouteEntries(rr models.RawRoute) []any {
 	var decoded any
 	if err := json.Unmarshal([]byte(rr.JSONData), &decoded); err != nil {
@@ -5105,7 +5608,7 @@ func (s *Server) buildRawListenServers(raws []models.RawRoute) map[string]map[st
 			g = &group{addrs: addrs}
 			groups[name] = g
 		}
-		g.routes = append(g.routes, rawRouteEntries(rr)...)
+		g.routes = append(g.routes, s.tenantSafeRawEntries(rr)...)
 	}
 	out := make(map[string]map[string]any, len(groups))
 	for name, g := range groups {
@@ -5343,7 +5846,9 @@ func (s *Server) buildHTTPRoutes(proxies []models.ProxyHost, redirs []models.Red
 		if rr.Listen != "" { // v2.36.1 (issue #64): served by its own listener, never on :80
 			continue
 		}
-		if !rr.ForceSSL {
+		// v2.59.3 (issue #121): a route written with explicit http:// addresses
+		// is never redirected to HTTPS, even if an older save left Force SSL on.
+		if !rr.ForceSSL || rawRouteHTTPOnly(&rr) {
 			httpRaws = append(httpRaws, rr)
 		} else {
 			forcedDomains = append(forcedDomains, rawRouteHosts(rr)...)
@@ -5351,17 +5856,14 @@ func (s *Server) buildHTTPRoutes(proxies []models.ProxyHost, redirs []models.Red
 	}
 	routes := s.buildMergedRoutes(httpProxies, httpRedirs, httpRaws)
 	if redirect := buildHTTPSRedirectRoute(forcedDomains); redirect != nil {
-		// Keep a configured catch-all 404 last. Global maintenance, when on,
-		// remains first because buildMergedRoutes prepends it.
-		if html, _ := models.GetSetting(s.DB, settingCatchAll404HTML); strings.TrimSpace(html) != "" && len(routes) > 0 {
-			routes = append(routes, nil)
-			copy(routes[len(routes)-1:], routes[len(routes)-2:])
-			routes[len(routes)-2] = redirect
-		} else {
-			routes = append(routes, redirect)
-		}
+		routes = append(routes, redirect)
 	}
-	return routes
+	// The HTTPS redirect for forced hosts must also beat a wildcard host that
+	// is served on :80 (issue #129).
+	routes = sortRoutesBySpecificity(routes)
+	// The fallback goes after the HTTPS redirect, so a forced-SSL host is
+	// redirected rather than answered with the fallback 404 (issue #123).
+	return s.withFallbackRoute(routes)
 }
 
 func buildHTTPSRedirectRoute(domains []string) map[string]any {
@@ -5774,6 +6276,36 @@ func (s *Server) requireAdmin(next http.Handler) http.Handler {
 
 // requireWrite blocks mutating requests for viewer-role users. Reads still
 // pass through, so viewers see the UI but can't change anything.
+// apiTokenScopeDenial returns why a bearer token with this scope may not make
+// request r, or "" when it may. It runs in requireAuth, so it covers every
+// route.
+//
+// Security (v2.57.1): scope used to be enforced only for read_only tokens here
+// and for proxy_write tokens inside the requireWrite route group. Routes that
+// live outside that group — creating API tokens, creating users, changing
+// settings — were therefore reachable with a proxy_write token: a leaked
+// CI token limited to proxy hosts could mint itself a full-scope token and an
+// admin account.
+func apiTokenScopeDenial(scope string, r *http.Request) string {
+	// API tokens never manage API tokens: minting or revoking one needs a
+	// signed-in browser session, so a leaked token cannot make itself permanent.
+	if r.URL.Path == "/api-tokens" || strings.HasPrefix(r.URL.Path, "/api-tokens/") {
+		return "API tokens cannot manage API tokens — sign in to the web UI"
+	}
+	mutating := r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions
+	switch scope {
+	case models.TokenScopeReadOnly:
+		if mutating {
+			return "token scope is read-only"
+		}
+	case models.TokenScopeProxyWrite:
+		if mutating && !proxyWriteTokenCanWritePath(r.URL.Path) {
+			return "token scope allows proxy-host writes only"
+		}
+	}
+	return ""
+}
+
 func (s *Server) requireWrite(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch currentAPITokenScope(r) {
@@ -5946,10 +6478,6 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request) {
 			renderErr(err.Error())
 			return
 		}
-		// Review finding #11 (2026-10-04): an admin setting someone's password
-		// is usually a lockout/recovery action, so the target's existing
-		// sessions must not survive it.
-		_ = models.DeleteSessionsForUser(s.DB, id, "")
 	}
 	_ = models.LogActivity(s.DB, s.currentServerID(r), s.currentUserEmail(r), "user_update", u.Email, role, true)
 	http.Redirect(w, r, "/users", http.StatusSeeOther)
@@ -6477,6 +7005,41 @@ func (s *Server) getForgotPassword(w http.ResponseWriter, r *http.Request) {
 // postForgotPassword processes the forgot-password form submission.
 // Always shows the "check your email" message even if the address doesn't
 // exist (prevents email enumeration).
+// publicBaseURL is the origin (scheme://host[:port], no trailing slash) used in
+// links that CaddyUI emails out: password reset and invitations.
+//
+// Order: CADDYUI_PUBLIC_URL, then the origin of the configured OIDC redirect
+// URL, then — only as a last resort — this request's own scheme and Host. The
+// last resort is what used to be the ONLY source, which let an unauthenticated
+// POST /forgot-password with a forged Host header get a working reset link
+// pointing at the attacker mailed to the victim. Set CADDYUI_PUBLIC_URL (for
+// example https://caddyui.example.com) to close that completely.
+func (s *Server) publicBaseURL(r *http.Request) string {
+	if base := cleanBaseURL(os.Getenv("CADDYUI_PUBLIC_URL")); base != "" {
+		return base
+	}
+	if v, _ := models.GetSetting(s.DB, settingOIDCRedirectURL); v != "" {
+		if base := cleanBaseURL(v); base != "" {
+			return base
+		}
+	}
+	scheme := "http"
+	if r.TLS != nil || (s.peerIsTrustedProxy(net.ParseIP(peerHost(r))) &&
+		strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")) {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
+}
+
+// cleanBaseURL reduces a URL to its http(s) origin, or "" when it is not one.
+func cleanBaseURL(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" || u.User != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
+}
+
 func (s *Server) postForgotPassword(w http.ResponseWriter, r *http.Request) {
 	email := strings.TrimSpace(strings.ToLower(r.FormValue("email")))
 	if email == "" {
@@ -6494,12 +7057,10 @@ func (s *Server) postForgotPassword(w http.ResponseWriter, r *http.Request) {
 		expires := time.Now().Add(time.Hour).Unix()
 		// Store token hash in settings: key=pw_reset_<hash>, value=<userID>:<expires>
 		_ = models.SetSetting(s.DB, "pw_reset_"+hash, fmt.Sprintf("%d:%d", u.ID, expires))
-		// Determine base URL for the reset link.
-		scheme := "https"
-		if r.TLS == nil {
-			scheme = "http"
-		}
-		resetURL := fmt.Sprintf("%s://%s/reset-password?token=%s", scheme, r.Host, token)
+		// Security (v2.57.1): the link's origin is a configured value, never the
+		// request's Host header — this endpoint is unauthenticated, so a forged
+		// Host would otherwise be mailed to the victim as a working reset link.
+		resetURL := fmt.Sprintf("%s/reset-password?token=%s", s.publicBaseURL(r), token)
 		body := fmt.Sprintf(
 			"Hello %s,\n\nA password reset was requested for your CaddyUI account.\n\n"+
 				"Click the link below to set a new password (expires in 1 hour):\n\n"+
@@ -6577,10 +7138,6 @@ func (s *Server) postResetPassword(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to update password", http.StatusInternalServerError)
 		return
 	}
-	// Review finding #11 (2026-10-04): a reset is the recovery path for a
-	// possibly-compromised account, so every session minted under the old
-	// password must stop working.
-	_ = models.DeleteSessionsForUser(s.DB, userID, "")
 	// Consume the token.
 	_ = models.SetSetting(s.DB, "pw_reset_"+hash, "")
 	http.Redirect(w, r, "/login?reset=1", http.StatusSeeOther)
@@ -6616,11 +7173,7 @@ func (s *Server) postInviteUser(w http.ResponseWriter, r *http.Request) {
 	expires := time.Now().Add(7 * 24 * time.Hour).Unix()
 	_ = models.SetSetting(s.DB, "invite_"+hash, fmt.Sprintf("%d:%d", userID, expires))
 
-	scheme := "https"
-	if r.TLS == nil {
-		scheme = "http"
-	}
-	acceptURL := fmt.Sprintf("%s://%s/accept-invite?token=%s", scheme, r.Host, token)
+	acceptURL := fmt.Sprintf("%s/accept-invite?token=%s", s.publicBaseURL(r), token) // v2.57.1: see postForgotPassword
 	body := fmt.Sprintf(
 		"You've been invited to CaddyUI.\n\n"+
 			"Click the link below to set your password and activate your account (link expires in 7 days):\n\n"+
@@ -6690,10 +7243,6 @@ func (s *Server) postAcceptInvite(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "update password: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// Review finding #11 (2026-10-04): set a fresh password on a stub account
-	// with no live sessions of its own — revoke defensively in case an invite
-	// is re-accepted after the account was already in use.
-	_ = models.DeleteSessionsForUser(s.DB, userID, "")
 	_ = models.SetSetting(s.DB, "invite_"+hash, "")
 	http.Redirect(w, r, "/login?invited=1", http.StatusSeeOther)
 }
@@ -6708,6 +7257,14 @@ func (s *Server) exportProxyHost(w http.ResponseWriter, r *http.Request) {
 	ph, err := models.GetProxyHost(s.DB, id)
 	if err != nil || ph == nil {
 		http.NotFound(w, r)
+		return
+	}
+	// Security (v2.57.1): the export carries the host's upstream basic-auth,
+	// API key and cookie secrets, so it needs the same ownership check as every
+	// other single-host handler. It had none — any signed-in account could
+	// export any tenant's host by ID.
+	if !s.canManageOwned(s.currentUser(r), ph.OwnerID) {
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	// Strip runtime fields before export.
@@ -6745,6 +7302,10 @@ func (s *Server) exportProxyHostCaddyfile(w http.ResponseWriter, r *http.Request
 	ph, err := models.GetProxyHost(s.DB, id)
 	if err != nil || ph == nil {
 		http.NotFound(w, r)
+		return
+	}
+	if !s.canManageOwned(s.currentUser(r), ph.OwnerID) { // v2.57.1 — see exportProxyHost
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	body := caddy.RenderProxyHostCaddyfileWithCertificate(*ph, s.certificateForCaddyfile(ph.CertificateID))
@@ -6861,10 +7422,35 @@ func (s *Server) importProxyHost(w http.ResponseWriter, r *http.Request) {
 	// Force safe defaults.
 	ph.ID = 0
 	ph.Enabled = false
+	// v2.57.1: the file is attacker-controlled. Runtime/DNS state belongs to
+	// the rows CaddyUI creates itself — an uploaded DNS record ID made a later
+	// delete of this host delete THAT record at the provider with the admin's
+	// credentials — and a certificate ID must not point at another tenant's.
+	ph.DNSProvider, ph.DNSProfileID, ph.DNSZoneID, ph.DNSZoneName, ph.DNSRecordID = "", "", "", "", ""
+	ph.DNSSkipRecord = true
+	ph.CFDNSRecordID, ph.CFZoneID, ph.PBDNSRecordID, ph.PBDomain = "", "", "", ""
+	ph.CertificateID = 0
+	ph.OwnerID, ph.OwnerEmail = sql.NullInt64{}, ""
 	cu := s.currentUser(r)
 	var ownerID int64
 	if cu != nil {
 		ownerID = cu.ID
+	}
+	// GHSA-r4wm-rgc5-q834 (3rd finding) follow-up: this handler builds a
+	// ProxyHost straight from attacker-controlled uploaded JSON, including
+	// ForwardHost/ForwardPort/ExtraUpstreams/UpstreamHostOverride, so it
+	// needs the same non-admin upstream guard the REST and form create paths
+	// already enforce.
+	if msg := s.validateProxyUpstreamsForUser(cu, &ph); msg != "" {
+		http.Error(w, msg, http.StatusForbidden)
+		return
+	}
+	if conflict, err := models.DomainsConflict(s.DB, s.currentServerID(r), ph.DomainList(), 0, 0); err != nil {
+		http.Error(w, "could not validate domains: "+err.Error(), http.StatusInternalServerError)
+		return
+	} else if conflict != "" {
+		http.Error(w, fmt.Sprintf("domain %q is already in use by another proxy or redirect on this server", conflict), http.StatusConflict)
+		return
 	}
 	newID, err := models.CreateProxyHost(s.DB, s.currentServerID(r), ownerID, &ph)
 	if err != nil {
@@ -6974,6 +7560,59 @@ func (s *Server) revokeAPIToken(w http.ResponseWriter, r *http.Request) {
 }
 
 // getLiveTraffic renders the live traffic feed page.
+// liveTrafficEvents is models.RecentAccessEvents scoped to what the user may
+// see: an admin sees everything; anyone else sees only the events of the hosts
+// they can see in the host list — the same rule /analytics applies. Live
+// traffic and its event stream used to show every host's requests (path, client
+// IP, status) to every role (v2.57.1).
+func (s *Server) liveTrafficEvents(u *models.User, since int64, limit int, serverID int64) ([]models.AccessEvent, error) {
+	if isAdminUser(u) {
+		return models.RecentAccessEvents(s.DB, since, limit, serverID)
+	}
+	allowed, err := s.scopedHostsForAnalytics(u, serverID)
+	if err != nil {
+		return nil, err
+	}
+	if len(allowed) == 0 {
+		return nil, nil
+	}
+	// Filtering happens after the query, so read a wider window than the
+	// caller's limit and cut back down.
+	events, err := models.RecentAccessEvents(s.DB, since, limit*20, serverID)
+	if err != nil {
+		return nil, err
+	}
+	out := events[:0:0]
+	for _, e := range events {
+		if eventHostAllowed(e.Host, allowed) {
+			out = append(out, e)
+			if len(out) == limit {
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+// eventHostAllowed reports whether host is one of the allowed hosts; a leading
+// "*." entry matches any host under that suffix, as hostMatchClause does.
+func eventHostAllowed(host string, allowed []string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	for _, a := range allowed {
+		a = strings.ToLower(strings.TrimSpace(a))
+		if a == "" {
+			continue
+		}
+		if a == host {
+			return true
+		}
+		if len(a) > 2 && strings.HasPrefix(a, "*.") && strings.HasSuffix(host, a[1:]) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) getLiveTraffic(w http.ResponseWriter, r *http.Request) {
 	u := s.currentUser(r)
 	serverID := s.currentServerID(r)
@@ -6986,7 +7625,7 @@ func (s *Server) getLiveTraffic(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// Seed with last 50 events for initial load.
-	events, err := models.RecentAccessEvents(s.DB, 0, 50, serverID)
+	events, err := s.liveTrafficEvents(u, 0, 50, serverID)
 	if err != nil {
 		log.Printf("live-traffic: query: %v", err)
 	}
@@ -7031,7 +7670,7 @@ func (s *Server) liveTrafficStream(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			events, err := models.RecentAccessEvents(s.DB, cursor, 100, serverID)
+			events, err := s.liveTrafficEvents(s.currentUser(r), cursor, 100, serverID)
 			if err != nil {
 				log.Printf("live-traffic SSE: %v", err)
 				continue
@@ -7096,9 +7735,10 @@ func (s *Server) getProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.render(w, r, "profile.html", map[string]any{
-		"User":  cu,
-		"Flash": r.URL.Query().Get("flash"),
-		"Error": r.URL.Query().Get("error"),
+		"User":    cu,
+		"Flash":   r.URL.Query().Get("flash"),
+		"Error":   r.URL.Query().Get("error"),
+		"Locales": translations().Locales(), // v2.62.0 (issue #128)
 	})
 }
 
@@ -7111,58 +7751,68 @@ func (s *Server) postProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	action := r.FormValue("action")
 	switch action {
+	case "update_locale": // v2.62.0 (issue #128)
+		loc := strings.TrimSpace(r.FormValue("locale"))
+		if loc != "" && !translations().Has(loc) {
+			http.Redirect(w, r, "/profile?error="+url.QueryEscape(s.tr(r, "profile.msg.unknown_language")), http.StatusFound)
+			return
+		}
+		if err := models.UpdateUserLocale(s.DB, cu.ID, loc); err != nil {
+			http.Redirect(w, r, "/profile?error="+url.QueryEscape(s.tr(r, "profile.msg.save_language_failed")), http.StatusFound)
+			return
+		}
+		lang := loc
+		if lang == "" {
+			lang = s.requestLocale(r, nil)
+		}
+		http.Redirect(w, r, "/profile?flash="+url.QueryEscape(translations().T(lang, "profile.language.saved")), http.StatusFound)
+		return
 	case "update_name":
 		name := strings.TrimSpace(r.FormValue("name"))
 		if name == "" {
-			http.Redirect(w, r, "/profile?error=Name+cannot+be+empty", http.StatusFound)
+			http.Redirect(w, r, "/profile?error="+url.QueryEscape(s.tr(r, "profile.msg.name_empty")), http.StatusFound)
 			return
 		}
 		if _, err := s.DB.Exec(`UPDATE users SET name=? WHERE id=?`, name, cu.ID); err != nil {
 			log.Printf("profile update_name: %v", err)
-			http.Redirect(w, r, "/profile?error=Failed+to+update+name", http.StatusFound)
+			http.Redirect(w, r, "/profile?error="+url.QueryEscape(s.tr(r, "profile.msg.name_failed")), http.StatusFound)
 			return
 		}
 		_ = models.LogActivity(s.DB, s.currentServerID(r), cu.Email, "profile_update_name", "", "", true)
-		http.Redirect(w, r, "/profile?flash=Name+updated+successfully", http.StatusFound)
+		http.Redirect(w, r, "/profile?flash="+url.QueryEscape(s.tr(r, "profile.msg.name_updated")), http.StatusFound)
 	case "change_password":
 		currentPw := r.FormValue("current_password")
 		newPw := r.FormValue("new_password")
 		confirmPw := r.FormValue("confirm_password")
 		if newPw != confirmPw {
-			http.Redirect(w, r, "/profile?error=New+passwords+do+not+match", http.StatusFound)
+			http.Redirect(w, r, "/profile?error="+url.QueryEscape(s.tr(r, "profile.msg.password_mismatch")), http.StatusFound)
 			return
 		}
 		if len(newPw) < 8 {
-			http.Redirect(w, r, "/profile?error=Password+must+be+at+least+8+characters", http.StatusFound)
+			http.Redirect(w, r, "/profile?error="+url.QueryEscape(s.tr(r, "profile.msg.password_short")), http.StatusFound)
 			return
 		}
 		u, err := models.GetUserByEmail(s.DB, cu.Email)
 		if err != nil || !auth.CheckPassword(u.PasswordHash, currentPw) {
-			http.Redirect(w, r, "/profile?error=Current+password+is+incorrect", http.StatusFound)
+			http.Redirect(w, r, "/profile?error="+url.QueryEscape(s.tr(r, "profile.msg.password_wrong")), http.StatusFound)
 			return
 		}
 		hash, err := auth.HashPassword(newPw)
 		if err != nil {
-			http.Redirect(w, r, "/profile?error=Failed+to+hash+password", http.StatusFound)
+			http.Redirect(w, r, "/profile?error="+url.QueryEscape(s.tr(r, "profile.msg.password_hash_failed")), http.StatusFound)
 			return
 		}
 		if _, err := s.DB.Exec(`UPDATE users SET password_hash=? WHERE id=?`, hash, cu.ID); err != nil {
 			log.Printf("profile change_password: %v", err)
-			http.Redirect(w, r, "/profile?error=Failed+to+update+password", http.StatusFound)
+			http.Redirect(w, r, "/profile?error="+url.QueryEscape(s.tr(r, "profile.msg.password_failed")), http.StatusFound)
 			return
 		}
-		// Review finding #11 (2026-10-04): drop every other session belonging
-		// to this user — a password change is how someone evicts a session
-		// they no longer trust — while keeping the current one signed in.
-		keepToken := ""
-		if c, cerr := r.Cookie(auth.SessionCookie); cerr == nil && c.Value != "" {
-			keepToken = auth.HashSessionToken(c.Value)
-		}
-		if serr := models.DeleteSessionsForUser(s.DB, cu.ID, keepToken); serr != nil {
-			log.Printf("profile change_password: revoke other sessions: %v", serr)
+		// v2.57.1: sign every OTHER device out; this browser keeps its session.
+		if c, err := r.Cookie(auth.SessionCookie); err == nil {
+			_ = auth.DeleteOtherSessions(s.DB, cu.ID, c.Value)
 		}
 		_ = models.LogActivity(s.DB, s.currentServerID(r), cu.Email, "profile_change_password", "", "", true)
-		http.Redirect(w, r, "/profile?flash=Password+changed+successfully", http.StatusFound)
+		http.Redirect(w, r, "/profile?flash="+url.QueryEscape(s.tr(r, "profile.msg.password_changed")), http.StatusFound)
 	default:
 		http.Redirect(w, r, "/profile", http.StatusFound)
 	}

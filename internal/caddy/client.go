@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -49,6 +50,12 @@ type Client struct {
 	// effective URL sent to the HTTP transport is rewritten to http://unix.
 	socketPath string
 	HTTP       *http.Client
+	// AdaptTextCheck, when set, is run on every Caddyfile sent to Adapt. A
+	// non-empty return refuses the request before Caddy sees it. CaddyUI sets
+	// it on the client used for a non-admin's request, because Caddy
+	// substitutes {$ENV} while adapting and its errors echo parsed text — so the
+	// text has to be refused BEFORE adapting, not inspected afterwards.
+	AdaptTextCheck func(caddyfile string) string
 }
 
 // New returns a Client configured to talk to adminURL. Pass empty strings for
@@ -202,9 +209,15 @@ func (c *Client) GetUpstreamHealth(ctx context.Context) ([]UpstreamStatus, error
 	return result, nil
 }
 
-// Validate POSTs the given config to /load?validate_only=true. Caddy runs the full
-// provisioning pipeline but does NOT apply the config. Returns nil if valid,
-// or an error with Caddy's diagnostic message if not.
+// Validate POSTs the given config to /load?validate_only=true and returns nil if
+// Caddy accepts it, or an error with Caddy's diagnostic message if not.
+//
+// CAUTION: Caddy does not implement validate_only — it is ignored, so a config
+// Caddy ACCEPTS is also APPLIED (confirmed on Caddy 2.11.7; apiValidateRawRoute
+// documents the same finding). A rejected config changes nothing. Callers that
+// build the config from the database plus one pending change therefore apply that
+// change early; never send a partial or throwaway config here, and use /adapt
+// when you only need to ask whether a module exists (see HasWAFModule).
 func (c *Client) Validate(cfg map[string]any) error {
 	return c.send(http.MethodPost, "/load?validate_only=true", cfg)
 }
@@ -226,7 +239,14 @@ func (c *Client) PatchPath(path string, val any) error {
 
 // DeletePath removes the config key at the given path from the live Caddy config.
 // No-op (returns nil) if the path does not exist (404).
+//
+// path may be given with or without the leading "/config" (v2.59.3): three
+// callers passed the full "/config/apps/..." form, which became
+// "/config/config/apps/..." and was answered with HTTP 500 "invalid traversal
+// path", so clearing the :80 server, removing a stale own-port server and
+// re-enabling HTTP/3 all failed.
 func (c *Client) DeletePath(path string) error {
+	path = "/" + strings.TrimPrefix(strings.TrimPrefix(path, "/config/"), "/")
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodDelete, c.AdminURL+"/config"+path, nil)
 	if err != nil {
 		return err
@@ -293,6 +313,11 @@ type AdaptResult struct {
 // Adapt sends Caddyfile source to Caddy's /adapt endpoint and returns the JSON config
 // Caddy would run if that Caddyfile were loaded. Does NOT modify the live config.
 func (c *Client) Adapt(caddyfile string) (*AdaptResult, error) {
+	if c.AdaptTextCheck != nil {
+		if msg := c.AdaptTextCheck(caddyfile); msg != "" {
+			return nil, fmt.Errorf("%s", msg)
+		}
+	}
 	req, err := http.NewRequest(http.MethodPost, c.AdminURL+"/adapt", strings.NewReader(caddyfile))
 	if err != nil {
 		return nil, err
@@ -1145,6 +1170,11 @@ func BuildProxyRoute(p models.ProxyHost, advancedHandlers []any) map[string]any 
 	}
 
 	handlers := []any{}
+	// v2.61.0: Coraza WAF from the host's middleware profile. First in the chain,
+	// so an attack is refused before authentication, rewrites or the upstream.
+	if p.WAF != nil && (p.WAF.Mode == models.WAFModeBlock || p.WAF.Mode == models.WAFModeDetect) {
+		handlers = append(handlers, BuildWAFHandler(p.WAF))
+	}
 	// v2.9.34: www redirect — inject a subroute that redirects between the
 	// www and bare forms of each domain before any other handler fires.
 	if p.WWWRedirect != "" {
@@ -3223,7 +3253,7 @@ func BuildProxyRoute(p models.ProxyHost, advancedHandlers []any) map[string]any 
 					"routes": []any{map[string]any{
 						"match": []any{map[string]any{
 							"not": []any{map[string]any{
-								"remote_ip": map[string]any{"ranges": allowedRanges},
+								"client_ip": map[string]any{"ranges": allowedRanges},
 							}},
 						}},
 						"handle":   []any{maintHandler},
@@ -3680,30 +3710,7 @@ func BuildProxyRoute(p models.ProxyHost, advancedHandlers []any) map[string]any 
 	// directly (typically 401/403). On 2xx, configured headers are copied to
 	// the upstream request and the proxy continues normally.
 	if p.ForwardAuthURL != "" {
-		faHandler := map[string]any{
-			"handler": "forward_auth",
-			"uri":     p.ForwardAuthURL,
-		}
-		// v2.9.52: forward_auth_method — HTTP method for the auth subrequest (default GET).
-		if p.ForwardAuthMethod != "" && p.ForwardAuthMethod != "GET" {
-			faHandler["method"] = strings.ToUpper(p.ForwardAuthMethod)
-		}
-		// v2.9.54: forward_auth_headers_prefix — prefix applied to all copied headers.
-		if p.ForwardAuthHeadersPrefix != "" {
-			faHandler["headers_prefix"] = p.ForwardAuthHeadersPrefix
-		}
-		if p.ForwardAuthCopyHeaders != "" {
-			var hdrs []any
-			for _, h := range strings.Split(p.ForwardAuthCopyHeaders, ",") {
-				h = strings.TrimSpace(h)
-				if h != "" {
-					hdrs = append(hdrs, h)
-				}
-			}
-			if len(hdrs) > 0 {
-				faHandler["copy_headers"] = hdrs
-			}
-		}
+		faHandler := buildForwardAuthHandler(p)
 		// v2.9.184: forward_auth_skip_paths — wrap forward_auth in a subroute that skips
 		// listed path prefixes, so health/metrics/etc. bypass the auth subrequest.
 		if p.ForwardAuthSkipPaths != "" {
@@ -4018,8 +4025,18 @@ func parseCIDRList(s string) []string {
 	return out
 }
 
+// v2.63.2 (issue #129): every CaddyUI IP check — host and redirect allowlists,
+// blocklists, block-private-IPs, the global blocklist and the maintenance
+// bypass list — matches Caddy's client_ip rather than remote_ip. Without
+// Settings › Security → Trusted proxy IPs/CIDRs the two are identical (the
+// address of the connection, so headers cannot spoof it); with trusted proxies
+// set, client_ip is the visitor's address taken from X-Forwarded-For (or the
+// configured client IP headers) — the only way an allowlist can work behind a
+// load balancer. remote_ip always saw the balancer, so allowlists either let
+// everyone in or nobody.
+
 // ipAllowlistSubroute returns a Caddy subroute handler that responds 403 to
-// any request whose remote IP is not in the given CIDR allowlist.
+// any request whose client IP is not in the given CIDR allowlist.
 func ipAllowlistSubroute(cidrList []string) map[string]any {
 	ranges := make([]any, len(cidrList))
 	for i, c := range cidrList {
@@ -4031,7 +4048,7 @@ func ipAllowlistSubroute(cidrList []string) map[string]any {
 			map[string]any{
 				"match": []any{map[string]any{
 					"not": []any{map[string]any{
-						"remote_ip": map[string]any{"ranges": ranges},
+						"client_ip": map[string]any{"ranges": ranges},
 					}},
 				}},
 				"handle":   []any{map[string]any{"handler": "static_response", "status_code": 403}},
@@ -4042,7 +4059,7 @@ func ipAllowlistSubroute(cidrList []string) map[string]any {
 }
 
 // ipBlocklistSubroute returns a Caddy subroute handler that responds 403 to
-// any request whose remote IP matches one of the listed CIDR ranges.
+// any request whose client IP matches one of the listed CIDR ranges.
 func ipBlocklistSubroute(cidrList []string) map[string]any {
 	ranges := make([]any, len(cidrList))
 	for i, c := range cidrList {
@@ -4053,7 +4070,7 @@ func ipBlocklistSubroute(cidrList []string) map[string]any {
 		"routes": []any{
 			map[string]any{
 				"match": []any{map[string]any{
-					"remote_ip": map[string]any{"ranges": ranges},
+					"client_ip": map[string]any{"ranges": ranges},
 				}},
 				"handle":   []any{map[string]any{"handler": "static_response", "status_code": 403}},
 				"terminal": true,
@@ -4076,7 +4093,7 @@ func BuildGlobalBlocklistRoute(raw string) map[string]any {
 		ranges[i] = c
 	}
 	return map[string]any{
-		"match":    []any{map[string]any{"remote_ip": map[string]any{"ranges": ranges}}},
+		"match":    []any{map[string]any{"client_ip": map[string]any{"ranges": ranges}}},
 		"handle":   []any{map[string]any{"handler": "static_response", "status_code": 403}},
 		"terminal": true,
 	}
@@ -4177,7 +4194,7 @@ func BuildRedirectRoute(r models.RedirectionHost) map[string]any {
 					map[string]any{
 						"match": []any{map[string]any{
 							"not": []any{map[string]any{
-								"remote_ip": map[string]any{"ranges": allowed},
+								"client_ip": map[string]any{"ranges": allowed},
 							}},
 						}},
 						"handle":   []any{map[string]any{"handler": "static_response", "status_code": 403}},
@@ -4394,15 +4411,24 @@ func ExploitBlockerSubroute() map[string]any {
 }
 
 // BuildTLSConnectionPolicies returns per-SNI TLS connection policies for proxy
-// hosts that have TLSMinVersion set. Returns nil when no enabled host specifies
-// a minimum version (caller skips writing the key to Caddy). When non-empty, the
-// last element is always an empty catch-all {} so Caddy applies its default TLS
-// settings to every other hostname — without it Caddy would only serve TLS for
-// explicitly matched SNIs.
+// hosts that have TLSMinVersion and/or client certificate authentication
+// (mTLS) set. Returns nil when no enabled host needs either (caller skips
+// writing the key to Caddy). When non-empty, the last element is always an
+// empty catch-all {} so Caddy applies its default TLS settings to every other
+// hostname — without it Caddy would only serve TLS for explicitly matched SNIs.
+//
+// Client auth lives here rather than in the route because that is where Caddy
+// puts it: the handshake is decided per connection, long before any route
+// matches. This is what a `tls { client_auth ... }` block in a Caddyfile
+// adapts to (discussion #137).
 func BuildTLSConnectionPolicies(proxies []models.ProxyHost) []any {
 	var policies []any
 	for _, p := range proxies {
-		if !p.Enabled || p.TLSMinVersion == "" {
+		if !p.Enabled {
+			continue
+		}
+		clientAuth := buildClientAuthentication(p)
+		if p.TLSMinVersion == "" && clientAuth == nil {
 			continue
 		}
 		domains := p.DomainList()
@@ -4413,10 +4439,14 @@ func BuildTLSConnectionPolicies(proxies []models.ProxyHost) []any {
 		for i, d := range domains {
 			snis[i] = d
 		}
-		policies = append(policies, map[string]any{
-			"match":        map[string]any{"sni": snis},
-			"protocol_min": "tls" + p.TLSMinVersion, // e.g. "tls1.2"
-		})
+		policy := map[string]any{"match": map[string]any{"sni": snis}}
+		if p.TLSMinVersion != "" {
+			policy["protocol_min"] = "tls" + p.TLSMinVersion // e.g. "tls1.2"
+		}
+		if clientAuth != nil {
+			policy["client_authentication"] = clientAuth
+		}
+		policies = append(policies, policy)
 	}
 	if len(policies) == 0 {
 		return nil
@@ -4424,6 +4454,31 @@ func BuildTLSConnectionPolicies(proxies []models.ProxyHost) []any {
 	// Catch-all: without this Caddy would refuse TLS for unmatched SNIs.
 	policies = append(policies, map[string]any{})
 	return policies
+}
+
+// buildClientAuthentication returns the client_authentication object for a
+// host's TLS connection policy, or nil when mTLS is off for that host.
+//
+// The trust pool uses Caddy's `file` CA provider with `pem_files` — the shape
+// `tls { client_auth { trust_pool file ... } }` adapts to. The files are read
+// by Caddy inside the Caddy container, not by CaddyUI, so these are paths as
+// Caddy sees them.
+func buildClientAuthentication(p models.ProxyHost) map[string]any {
+	if !p.ClientAuthEnabled() {
+		return nil
+	}
+	ca := map[string]any{"mode": p.ClientAuthMode}
+	if files := p.ClientAuthCAFileList(); len(files) > 0 {
+		pemFiles := make([]any, len(files))
+		for i, f := range files {
+			pemFiles[i] = f
+		}
+		ca["ca"] = map[string]any{
+			"provider":  "file",
+			"pem_files": pemFiles,
+		}
+	}
+	return ca
 }
 
 // methodStrings converts a []any of method strings back to []string for the
@@ -4501,4 +4556,145 @@ func parseHeaderReplaceRules(raw string) map[string][]any {
 		})
 	}
 	return out
+}
+
+// buildForwardAuthHandler returns the Caddy JSON for a proxy host's forward
+// auth (v2.59.5, issues #124/#125). "forward_auth" is a Caddyfile DIRECTIVE, not
+// a JSON handler module — CaddyUI used to emit {"handler":"forward_auth"} and
+// Caddy rejected the whole config with "unknown module:
+// http.handlers.forward_auth", so forward auth has never worked since v2.9.27.
+// This is exactly what the directive expands to (checked against Caddy's own
+// /adapt output): a reverse_proxy to the auth service that rewrites the method
+// and URI, tells it the original method/URI, and — on a 2xx answer only — copies
+// the chosen response headers onto the request that continues to the real
+// upstream. A non-2xx answer is relayed to the client by reverse_proxy's default.
+// Each copied header is deleted from the incoming request first, so a client can
+// never supply one itself.
+//
+// An unusable URL fails CLOSED: the host answers 503 instead of silently
+// serving without authentication.
+func buildForwardAuthHandler(p models.ProxyHost) map[string]any {
+	u, err := url.Parse(strings.TrimSpace(p.ForwardAuthURL))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return map[string]any{
+			"handler":     "static_response",
+			"status_code": 503,
+			"body":        "Forward auth is misconfigured for this host.",
+		}
+	}
+	port := u.Port()
+	if port == "" {
+		port = "80"
+		if u.Scheme == "https" {
+			port = "443"
+		}
+	}
+	uri := u.EscapedPath()
+	if uri == "" {
+		uri = "/"
+	}
+	if u.RawQuery != "" {
+		uri += "?" + u.RawQuery
+	}
+	method := strings.ToUpper(strings.TrimSpace(p.ForwardAuthMethod))
+	if method == "" {
+		method = "GET"
+	}
+
+	var copyRoutes []any
+	copyRoutes = append(copyRoutes, map[string]any{"handle": []any{map[string]any{"handler": "vars"}}})
+	for _, h := range strings.Split(p.ForwardAuthCopyHeaders, ",") {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			continue
+		}
+		dest := p.ForwardAuthHeadersPrefix + h
+		src := "{http.reverse_proxy.header." + h + "}"
+		copyRoutes = append(copyRoutes,
+			map[string]any{"handle": []any{map[string]any{
+				"handler": "headers",
+				"request": map[string]any{"delete": []any{dest}},
+			}}},
+			map[string]any{
+				"handle": []any{map[string]any{
+					"handler": "headers",
+					"request": map[string]any{"set": map[string]any{dest: []any{src}}},
+				}},
+				"match": []any{map[string]any{"not": []any{map[string]any{
+					"vars": map[string]any{src: []any{""}},
+				}}}},
+			})
+	}
+
+	handler := map[string]any{
+		"handler":   "reverse_proxy",
+		"upstreams": []any{map[string]any{"dial": net.JoinHostPort(u.Hostname(), port)}},
+		"rewrite":   map[string]any{"method": method, "uri": uri},
+		"headers": map[string]any{"request": map[string]any{"set": map[string]any{
+			"X-Forwarded-Method": []any{"{http.request.method}"},
+			"X-Forwarded-Uri":    []any{"{http.request.uri}"},
+		}}},
+		"handle_response": []any{map[string]any{
+			"match":  map[string]any{"status_code": []any{2}},
+			"routes": copyRoutes,
+		}},
+	}
+	if u.Scheme == "https" {
+		handler["transport"] = map[string]any{"protocol": "http", "tls": map[string]any{}}
+	}
+	return handler
+}
+
+// BuildWAFDirectives renders the SecLang for a profile's WAF choice: Coraza's
+// recommended base, optionally the OWASP Core Rule Set at the chosen paranoia
+// level, the engine mode, then the operator's own directives — last, so they can
+// tune or override what came before (SecRuleRemoveById and the like).
+func BuildWAFDirectives(w *models.WAFSettings) string {
+	var b strings.Builder
+	b.WriteString("Include @coraza.conf-recommended\n")
+	if w.CRS {
+		b.WriteString("Include @crs-setup.conf.example\n")
+		if w.Paranoia > 1 {
+			fmt.Fprintf(&b, "SecAction \"id:900000,phase:1,pass,t:none,nolog,setvar:tx.blocking_paranoia_level=%d\"\n", w.Paranoia)
+		}
+		b.WriteString("Include @owasp_crs/*.conf\n")
+	}
+	if w.Mode == models.WAFModeBlock {
+		b.WriteString("SecRuleEngine On\n")
+	} else {
+		b.WriteString("SecRuleEngine DetectionOnly\n")
+	}
+	if extra := strings.TrimSpace(w.Directives); extra != "" {
+		b.WriteString(extra)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// BuildWAFHandler is the coraza-caddy handler (module http.handlers.waf).
+func BuildWAFHandler(w *models.WAFSettings) map[string]any {
+	return map[string]any{
+		"handler":        "waf",
+		"load_owasp_crs": w.CRS,
+		"directives":     BuildWAFDirectives(w),
+	}
+}
+
+// wafProbeCaddyfile adapts only when the Coraza module is compiled in.
+const wafProbeCaddyfile = "{\n\torder coraza_waf first\n}\n:65530 {\n\tcoraza_waf {\n\t\tdirectives `SecRuleEngine Off`\n\t}\n}\n"
+
+// HasWAFModule reports whether this Caddy has the Coraza WAF module. It uses
+// /adapt, which never applies anything (a /load probe would reconfigure the live
+// server — Caddy ignores validate_only). known is false when Caddy could not be
+// asked, in which case callers should not block on it.
+func (c *Client) HasWAFModule() (present, known bool) {
+	_, err := c.Adapt(wafProbeCaddyfile)
+	if err == nil {
+		return true, true
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "not a registered directive") || strings.Contains(msg, "unrecognized directive") || strings.Contains(msg, "unrecognized global option") {
+		return false, true
+	}
+	return false, false
 }

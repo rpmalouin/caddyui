@@ -5,6 +5,498 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) · Versi
 
 ---
 
+## [2.65.1] - 2026-10-16 - Go toolchain 1.27.2 closes 12 standard-library vulnerabilities
+
+### Security
+
+- **The published binaries were built with Go 1.26.8, which govulncheck reports as affected by 12 standard-library vulnerabilities.** Mostly denial-of-service and request-desynchronisation issues in `net/http` — an HTTP/2 HPACK encoder race, double flow-control refunds, memory exhaustion via trailers, unbounded `Range` header parsing, HTTP/1 desync after a CONNECT response — plus a MIME header memory-limit bypass in `net/textproto`, malformed ECH handling in `crypto/tls`, and two `html/template` context-tracking issues reachable from CaddyUI's own page rendering. The pinned toolchain is now **Go 1.27.2** and govulncheck reports zero.
+- **The Docker images were never affected.** They build on `golang:1.27-alpine`, which resolves to 1.27.2 — already the fixed release for that line. Only the native binaries from the GitHub releases page carried the vulnerable runtime, so **anyone running `applegater/caddyui` had nothing to do**; anyone running a downloaded binary should take v2.65.1.
+- This also closes a gap where one release was compiled two different ways: the binaries from the `toolchain` line in `go.mod` and the images from the Dockerfile's base image. Both now use 1.27.2.
+
+---
+
+## [2.65.0] - 2026-10-16 - Admin allowlist matches the real visitor; SSO roles from group claims (#139, #140)
+
+### Security
+
+- **The admin panel IP allowlist did not restrict what it appeared to.** It compared the raw connection address, ignoring *Trusted proxy IPs/CIDRs* entirely, so behind any reverse proxy it only ever saw the proxy. Two symmetrical failures followed, and @BenRLange hit the first:
+  - An allowlist naming **your own address locked you out**, because your address never reached the check.
+  - The obvious workaround — allowlisting **the proxy** — then admitted **every** visitor who arrived through it, at any IP, while Settings still read as restricted. An admin could believe the panel was limited to their home address while it was reachable by anyone who could reach the proxy.
+
+  The allowlist now matches the same trusted-proxy-aware address the login rate limiter uses: a forwarded header is believed only when the connection came from a trusted proxy, and the **right-most** `X-Forwarded-For` entry is taken — the one your proxy appended — so a visitor cannot prepend a chosen address and be believed. Same class of bug as #129, which v2.63.2 fixed for the Caddy-side allowlists; this was CaddyUI's own panel and was missed at the time.
+
+  **If you use this allowlist, re-check it after upgrading.** A list that "worked" because it named the proxy now restricts by real visitor address, as it always claimed to.
+
+### Added
+
+- **Settings → Security shows the address you are connecting from**, and whether it was read from the connection or from a forwarded header via a trusted proxy (#140). The allowlist is checked against exactly that address, so an entry that would lock you out is visible before you save it rather than after. If it names the proxy instead of you, the hint says to configure *Trusted proxy IPs/CIDRs* first.
+- **`CADDYUI_ADMIN_ALLOWLIST` recovers a lockout from compose** (#140). Set it in your compose file and restart: it overrides the stored list, and `CADDYUI_ADMIN_ALLOWLIST=off` disables the gate entirely while you get back in. The saved list is left untouched, so removing the variable restores it. An empty value counts as not set, so a blank entry in compose cannot lock you out by itself.
+- **Auto-created SSO accounts can be given a role** (#139). *Settings → Security → SSO* gains a **default role** for accounts created on first sign-in — still `view` unless you change it, so upgrading widens nobody's access — plus optional mapping from a **groups claim**: name the claim your IdP sends and write `group|role` rules, one per line, first match wins. Group names match case-insensitively, since IdPs are inconsistent about casing. A rule naming a role CaddyUI does not have is refused when you save, with the line number, rather than stored and silently ignored.
+  - The claim is read defensively: an array of strings, a single string, or a space/comma-separated string all work, and any other shape means "no groups" and a sign-in on the default role rather than a failure.
+  - Roles are applied **at account creation only**. An existing user's role is never changed by signing in, so a mapping cannot demote or escalate someone already set up under *Users*.
+
+### Fixed
+
+- **The SSO callback URL is spelled out in full** (#139). The field's placeholder was the complete `…/auth/oidc/callback`, but the input is too narrow to show the end of it, so it read as a recommendation to register the bare `/auth/oidc` path — and registering that causes the login to fail at the provider. The exact URL, built from the host you are using, is now shown under the field as selectable text where it cannot be clipped.
+
+---
+
+## [2.64.2] - 2026-10-15 - Declining two-factor auth no longer looks like unfinished setup (#138)
+
+### Fixed
+
+- **The readiness banner counted a recommendation as a requirement.** Reported by @tkkost: with two-factor auth deliberately not in use, Operations showed *"Environment readiness · 3 of 4 required"* and **Continue setup** permanently, so a considered decision looked like an install someone had abandoned half-done. The onboarding page labels that same step *"Recommended"*, so the banner was contradicting it. Readiness now counts the three foundations that genuinely are required — your administrator account, a connected Caddy, and a published service — and reaches a finished state without TOTP. The step is still listed, and the security recommendation still appears; neither claims the install is incomplete.
+  - Worth knowing if you go looking: that counter was driven by **your own account's** TOTP, not the site-wide policy. Toggling the policy never moved it.
+- **The "two-factor authentication is not required" recommendation can be dismissed.** Choosing not to require TOTP across the board is a legitimate decision, and a recommendation that cannot be acknowledged is just a permanent nag. There is now a **Dismiss** next to it, following the same pattern as the unused-certificates recommendation. Turning the policy on clears the dismissal, so switching it off again later raises the recommendation afresh rather than leaving it silently suppressed by a decision made months earlier.
+
+### Notes
+
+- Nothing about enforcement changed — this release only affects what the dashboard claims about your setup. If you require TOTP site-wide, it is still required.
+- Simplified Chinese: the readiness count and body text are updated, and **Dismiss** is translated.
+
+---
+
+## [2.64.1] - 2026-10-15 - One two-factor policy setting instead of two (#138)
+
+### Fixed
+
+- **Settings › Security had two toggles for one policy.** *Require 2FA for all users* and *Require TOTP for all users* were separate settings whose descriptions said nearly the same thing, and reported by @tkkost as impossible to tell apart. They were: both sent a user without TOTP to the setup page, and the dashboard's security recommendation already treated them as interchangeable. There is now a single **Require two-factor authentication (TOTP) for everyone**.
+  - **Nothing is switched off by the upgrade.** An install that had set only one of the pair still enforces the policy — both stored keys are honoured, and saving writes both, so downgrading to an earlier release keeps enforcing it too.
+  - The two old toggles enforced the policy with *different* exclusion lists: the TOTP one would answer a session-authenticated `/api/` request with a redirect to an HTML page, while the 2FA one let it through. The surviving check keeps the wider list, so JSON callers get JSON.
+  - They also used different checkbox conventions and one saved immediately while the other waited for **Save**. One toggle, one behaviour.
+- **The per-user control was hard to find.** The user-menu entry is now **My two-factor authentication** rather than the ambiguous *Two-factor auth*, and the policy setting says in so many words that it is site-wide, that it enrols nobody, and that individual accounts are managed from that menu. @tkkost had reported TOTP as impossible to disable before finding this entry — the disable itself was working correctly all along.
+- **The policy applies to the admin who turns it on**, which is easy to walk into: with no TOTP on your own account, saving it sends you to enrolment and you must finish before reaching Settings again, including to switch it back off. That was already true; the setting now warns before you save. The enrolment page stays reachable, so this strands nobody.
+
+### Notes
+
+- Simplified Chinese: the renamed user-menu entry is translated (*我的两步验证*). The new policy description is English until a translation lands.
+
+---
+
+## [2.64.0] - 2026-10-14 - Client certificate authentication (mTLS) on proxy hosts (discussion #137)
+
+### Added
+
+- **A proxy host can require a client certificate.** *Proxy Hosts → edit → Security* gains **Client certificate authentication (mTLS)**: a mode and a list of trusted CA certificate files. Caddy then asks the visitor's browser or client for a certificate during the TLS handshake and refuses the connection unless it checks out. The four modes are Caddy's own — *Require and verify* (the usual meaning of mTLS), *Verify if given* (optional certificate, validated when sent), and *Require* / *Request*, which accept any certificate the client offers for cases where something behind Caddy does the checking.
+  - The trusted CA files are read **by Caddy, inside the Caddy container**, exactly like certificate files are — so the path is the one Caddy sees, and the file does not need mounting into CaddyUI.
+  - Your backend reads the certificate through the usual placeholders. For EJBCA and friends, add `SSL_CLIENT_CERT: {http.request.tls.client.certificate_der_base64}` under *Custom headers* on the same page.
+  - Verified end to end against Caddy 2.11.7 with a throwaway CA: no certificate is refused with *certificate required*, a certificate signed by the trusted CA gets through, and a self-signed one is refused with *unknown ca*.
+- **A verifying mode with no trusted CA is refused at save time.** Caddy accepts that combination and then turns away every client, because there is nothing to verify against — the save now explains this instead, and suggests *Request* / *Require* for the no-verification case.
+- **`client_auth_mode` and `client_auth_ca_files` on the REST API** (`/api/v1/proxy-hosts`), with the same validation. On `PATCH`, send `"client_auth_mode": "off"` to switch mTLS off — an empty string leaves it unchanged, as it does for every other field there.
+- **Export to Caddyfile writes the `tls { client_auth { … } }` block.** Leaving it out would make an exported site look open to anyone.
+
+### Fixed
+
+- **An Advanced route carrying `tls { client_auth … }` no longer discards it in silence.** This is what prompted the discussion: Caddy keeps client authentication in the server's TLS connection policies, not in the route, and an Advanced route stores routes only — so the block vanished during import, the generated JSON contained the `reverse_proxy` headers but no `client_auth`, and the site came up serving everyone while looking configured. Importing such a block is now refused, naming the hostnames affected and pointing at the proxy-host setting above, which does reach Caddy.
+
+### Notes
+
+- Existing hosts are unaffected: the new mode defaults to off, so nothing starts asking for client certificates after the upgrade.
+- Not to be confused with **Upstream mTLS Client Certificate / Key** further down the same form — those are Caddy presenting a certificate *to your backend*, the opposite direction. Both can be used at once.
+
+---
+
+## [2.63.2] - 2026-10-10 - IP allowlists work behind a load balancer (#129)
+
+### Fixed
+
+- **IP allowlists and blocklists now honour Settings › Security → Trusted proxy IPs/CIDRs.** Every IP check CaddyUI generates matched Caddy's `remote_ip`, which is always the address of the machine that connects to Caddy. Behind a load balancer, reverse proxy or CDN, that is the balancer, never the visitor, so an allowlist either let everyone in (balancer inside the list) or locked everyone out (balancer outside it), whatever the trusted-proxy setting said. The checks now use Caddy's `client_ip`:
+  - **No trusted proxies configured:** `client_ip` is exactly the connection's address, so nothing changes and a forged `X-Forwarded-For` header is still ignored.
+  - **Trusted proxies configured:** the visitor's real address is taken from `X-Forwarded-For` (or the configured *Client IP headers*), but only on connections that come from a trusted proxy.
+  - This covers proxy-host and redirection allowlists, IP blocklists, *Block private IPs*, the global blocklist and the maintenance-mode bypass list. Verified on Caddy 2.11.7 through a load balancer: with the balancer trusted, an allowed visitor gets through, an outside visitor gets 403, and a forged header sent straight to Caddy is refused.
+- The allowlist and trusted-proxy fields explain this, including that anything listed as a trusted proxy can claim any client address.
+
+### Notes
+
+- **Behind a load balancer?** Add its address under **Settings › Security → Trusted proxy IPs/CIDRs**. If it forwards TCP/TLS without HTTP (passthrough), it cannot pass the visitor's address in a header, and IP allowlists cannot tell visitors apart.
+- `client_ip` needs **Caddy 2.7 or newer** (the `applegater/caddyui-caddy` image ships 2.11.7).
+
+---
+
+## [2.63.1] - 2026-10-10 - Simplified Chinese covers the Dashboard, Profile and Settings › General (#131–#135)
+
+### Added
+
+- **The Simplified Chinese (`zh-CN`) translation now covers everything on the catalog**, contributed again by @chongfenglaosiji in five pull requests: Settings › General (#131), the Settings navigation, post-apply checks and colour themes (#132), the Dashboard (#133), Profile (#134), and the health-dot tooltips and shared status words (#135). Every one of the 313 keys is translated, so these pages are fully Chinese with no English left over. The *Follow each browser* option was also reworded slightly. Thank you!
+
+---
+
+## [2.63.0] - 2026-10-10 - Dashboard, Profile and Settings › General can be translated (#128)
+
+### Added
+
+- **250 more interface strings are on the translation catalog**, so a translation can now cover the whole **Dashboard** (banners, server and route summary, traffic, system health, *Needs attention*, the fleet cards, recent activity and the proxy-host / advanced-route tables, including the health-dot tooltips drawn by its script), the whole **Profile** page (including its saved/error messages), the **Settings navigation** (every section's name and description, the page heading and the *Save … settings* button) and the full **Settings › General** page (general options, timezone and post-apply checks). English output is unchanged.
+- **Messages built on the server can be translated too** — the Profile page's confirmations and errors are now looked up in the reader's language before the redirect.
+- Shared status words (*Online*, *Offline*, *Enabled*, *Disabled*, …) have their own `status.*` keys, ready for the list pages to reuse.
+
+### Notes
+
+- Translations simply show English for the new keys until they are updated — nothing breaks in the meantime. The remaining Settings pages, the list pages and the forms follow in the next batches; the large proxy-host form comes last.
+- A new test keeps the Settings navigation (defined in Go) and its English catalog text identical, and another renders the Dashboard, Profile and Settings › General pages in a second language.
+
+---
+
+## [2.62.2] - 2026-10-10 - The default language setting now takes effect
+
+### Fixed
+
+- **Settings → General → Default language did nothing for most people.** The language was chosen as: your own profile choice, then the **browser's** language, then the site default — and since every English-language browser matches the English catalog, the site default was never reached. Choosing Simplified Chinese as the default visibly changed nothing. The order is now: your own **Profile → Language** choice, then the **site default** when an administrator has set one, then the browser, then English. Leaving the default on *Follow each browser* keeps the old browser-based behaviour. The setting's help text says so (in English and Chinese).
+
+---
+
+## [2.62.1] - 2026-10-10 - Simplified Chinese (#130)
+
+### Added
+
+- **Simplified Chinese (`zh-CN`) interface translation**, contributed by @chongfenglaosiji (#130) — every key currently in the catalog: the navigation and its sections, the top bar and *Create* menu, the user menu, the command-palette search, the list-page titles and the language settings. Pick it under **Profile → Language**; browsers that ask for Chinese (`zh`, `zh-CN`, `zh-TW`, …) get it automatically. Parts of the interface not yet moved onto the catalog stay in English and will follow release by release. Thank you!
+
+---
+
+## [2.62.0] - 2026-10-09 - Interface languages: the localization plumbing (#128)
+
+Requested by @chongfenglaosiji, who has offered to translate CaddyUI into Simplified Chinese.
+
+### Added
+
+- **CaddyUI can be shown in other languages.** Translations are flat JSON catalogs in `web/i18n/` — one per language, named by its code (`en.json`, `zh-CN.json`, …) and embedded in the binary — with stable dotted keys such as `nav.proxy_hosts`. **English is the source of truth and the fallback**: any key a translation lacks (or leaves empty) shows in English, so a partial translation never breaks a page, and a key missing everywhere shows as itself rather than blank. Texts can carry named placeholders like `{count}`.
+- **Each person chooses their own language** under **Profile → Language**, available to every role; the default is *Use my browser's language*. Otherwise the browser's `Accept-Language` decides (a related variant such as `zh-TW` or plain `zh` uses the closest available catalog), then **Settings → General → Default language**, then English. Only languages that have a catalog can be chosen. The page's `<html lang>` follows the choice.
+- **Templates and scripts share one catalog**: templates use `{{t $ "key"}}`, and keys starting with `js.` reach the browser as `window.CADDYUI_I18N` with a small `caddyuiT(key, vars)` helper.
+- **Guard rails, as tests:** every key a template or script uses must exist in `en.json`, and every translation may only use English's keys and must keep the same placeholders — so a typo or drift fails the build instead of showing a raw key.
+- **First strings on the catalog:** the navigation and its section titles, the top bar, the *Create* menu, the user menu, the command-palette search, the list-page titles for proxy hosts, redirections, advanced routes and certificates, and the new language settings. English output is unchanged. The rest of the interface moves onto keys over the next releases, the large proxy-host form last.
+- **[docs/TRANSLATING.md](docs/TRANSLATING.md)** explains the format and how to send a translation as a data-only pull request.
+
+### Notes
+
+- This release ships English only; the first translation (Simplified Chinese) is coming from the community. New column `users.locale` and setting `default_locale` are created automatically.
+
+---
+
+## [2.61.3] - 2026-10-09 - Security: a wildcard host could bypass a specific host's IP allowlist (#129)
+
+Reported by @hieronymousch: after upgrading, sites with an IP allowlist accepted every client, and attaching a middleware profile made no difference.
+
+### Security
+
+- **A wildcard proxy host could take over a more specific host's traffic, skipping its IP allowlist and every other protection on that host's route.** Caddy runs the first route that matches a request. CaddyUI emitted host routes in list order — manual sort order, then newest first — so a wildcard host such as `*.example.com` created *after* `app.example.com` came first, and requests for `app.example.com` were served by the wildcard's route. Everything configured on `app.example.com` itself was then skipped: its **IP allowlist**, Basic Auth, forward auth, the middleware profile attached to it and its WAF. Reproduced on a real Caddy: a client outside `app.example.com`'s allowlist got `200` instead of `403`.
+- **Fix:** host routes are now ordered by specificity, the way Caddy's own Caddyfile does it: exact hostnames before wildcards, more specific wildcards (`*.a.example.com`) before broader ones (`*.example.com`), and a path-scoped route before the same host's catch-all. A route that also carries a wildcard counts as a wildcard route. Applied to the HTTPS server, the plain-HTTP server (where a forced host's HTTPS redirect now always beats a wildcard host) and the managed wildcard-certificate routes. Only routes that match on hostnames move, and only among themselves: global maintenance, an Advanced route without a host matcher and the fallback keep their exact positions, and the manual order still decides between routes that are equally specific. After the fix the same request gets `403`, and other names still reach the wildcard host.
+- **Upgrade if you have both wildcard and specific proxy hosts**, especially when the specific ones rely on an IP allowlist, Basic Auth, forward auth or a WAF profile. The fix applies on the next sync (a restart with sync-on-start, or any save).
+
+---
+
+## [2.61.2] - 2026-10-08 - Certificate export: a permission problem is reported as one (discussion #127)
+
+Reported by @devacc337: *Export failed — Caddy has not stored a certificate for \*.domain.com yet (looked in /caddy-data)*, with the certificate plainly present in the volume.
+
+### Fixed
+
+- **A permission error was reported as a missing certificate.** Caddy keeps its data directory private to the user it runs as — mode `0700`, owned by root in the official image — while the CaddyUI container runs as an unprivileged user (uid 10001), so it could not even list `caddy/certificates`. The lookup swallowed that "permission denied" and fell through to *"Caddy has not stored a certificate … yet"* (with `looked in /caddy-data` and no sign of the `certificates` directory — the tell-tale), sending people to look for a certificate that was sitting right there. Reproduced as uid 10001 against a root-only tree; the same lookup succeeds as root. The error now says what is wrong: *CaddyUI is not allowed to read Caddy's certificate storage (permission denied on …), CaddyUI runs as uid N — run the caddyui container as that user, with the official images `user: "0:0"`, the data volume can stay read-only.* A certificate that really is missing still reports as missing. The same lookup serves *Sync from current* for shared managed certificates, which gets the clearer message too.
+- **Export-directory write failures get the same treatment.** A permission error creating or writing the export directory (a fresh Docker volume is root-owned, and CaddyUI runs unprivileged) now says CaddyUI is not allowed to write there and how to fix it.
+
+### Docs
+
+- To use **Export to a directory**, run the `caddyui` service as root — `user: "0:0"` — so it can read Caddy's private data volume (mount it read-only) and write to a fresh export volume. Added to the example `docker-compose.yml` (commented, next to the export mounts), the Data directory help on Caddy Fleet → edit server, and the Documentation page.
+
+---
+
+## [2.61.1] - 2026-10-08 - The Caddy `command` in the example compose files works now (#7)
+
+Reported again on #7 by @devacc337.
+
+### Fixed
+
+- **The example `command` for the Caddy container crashed it.** The snippet added for #7 (`command: >- mkdir -p /config/caddy; [ -f … ] || echo '{}' > …; exec caddy run …`) is not run through a shell, so Compose started `mkdir` on its own and the container exited immediately with code 0 — with `restart: unless-stopped`, a restart loop, and Caddy never started. (Reproduced with `docker compose` on a clean volume.) It is now `command: [/bin/sh, -c, "…"]`, which seeds an empty `{}` `autosave.json` on first boot and leaves an existing one alone, then resumes from it; the same container starts and resumes normally. Fixed in `docker-compose.yml`, the README (both copies), `DOCKERHUB.md` and `docs/dockerhub.md`.
+- **If you copied the old snippet** since it was published, replace the `command:` block of your `caddy` service with the new one and run `docker compose up -d --force-recreate caddy`. Setups that mount their own `autosave.json`, or that never used this snippet, are unaffected.
+- The README note now explains why the shell wrapper is needed. No application code changed.
+
+---
+
+## [2.61.0] - 2026-10-07 - Coraza WAF in middleware profiles, and Layer4 on a shared port (#126)
+
+### Added
+
+- **Coraza web application firewall in middleware profiles.** A profile can now enable [Coraza](https://coraza.io) with the OWASP Core Rule Set for every host that uses it: **Detection only** (logs what it would block — visible under Server Logs — and blocks nothing; the recommended first step) or **Block** (answers 403), a **paranoia level** from 1 to 4, a switch for the Core Rule Set itself, and **custom SecLang directives** applied last (for example `SecRuleRemoveById 942100` to silence one rule). The WAF runs first in the host's route, ahead of redirects, forward auth and the upstream, and is added when the config is built — the host row never stores it, and detaching the profile removes it. Verified on a real Coraza build of Caddy 2.11.7: SQL injection and XSS probes got `403` in Block mode, passed (and were logged) in Detection mode, and a host without the profile was untouched. Hosts that share a profile share one rule set (memory stayed flat from 1 to 10 hosts).
+- **`applegater/caddyui-caddy` now includes the Coraza module** (`github.com/corazawaf/coraza-caddy/v2` v2.6.x, `http.handlers.waf`) alongside the DNS providers, CrowdSec bouncer, rate limiting and `caddy-l4`. The image is about 5 MB larger. Existing installs keep working unchanged; **to use the WAF, pull the new image and recreate your Caddy** (the module only exists in the new build, so that is a brief restart of Caddy itself).
+- **A Caddy without the module is refused up front.** Saving a WAF profile, editing one that is in use, or attaching one to a host first asks every affected server's Caddy whether it has the module (through `/adapt`, which applies nothing) and names the ones that do not, instead of letting Caddy reject that server's entire config and block every later sync. If a rejection still happens, the error now says what to do.
+- **Layer4 on a shared port (#126).** A Layer4 proxy can ride a port that is already in use instead of binding its own — for example SSH for `ssh.example.com` over `:443` beside normal HTTPS. Pick *Share the HTTPS / HTTP port* on the Layer4 proxy form, then what to take: connections with given **TLS SNI** names (HTTPS port) or **HTTP hostnames** (HTTP port), or an **SSH**, **RDP** or **PostgreSQL** connection. CaddyUI writes a `caddy-l4` **listener wrapper** on the HTTPS (`srv0`) or HTTP (`caddyui_http`) server; everything that matches no shared proxy carries on to Caddy's normal TLS and HTTP handling. An SNI route can pass the TLS connection through to the upstream (default) or terminate TLS in Caddy and send plain TCP. TCP only — wrapping UDP is not offered. Shared proxies deploy to fleet targets, follow automatic deployment targets and the node-local switch like any other Layer4 proxy.
+
+### Changed
+
+- The wrapper is written in the order Caddy needs: any wrapper you configured yourself (PROXY protocol, for example) first, then CaddyUI's layer4 wrapper, then an explicit `tls` wrapper. Found on a real Caddy: with only the layer4 wrapper listed Caddy applies TLS *first*, so the matchers saw decrypted garbage. CaddyUI only ever replaces or removes the layer4 wrapper it wrote itself; a layer4 wrapper set any other way is left alone.
+- The Layer4 form's error for ports 80/443 now points at sharing.
+- `Client.Validate`'s documentation was wrong: Caddy ignores `validate_only`, so a config it accepts is also applied. The comment now says so; behaviour is unchanged.
+
+### Notes
+
+- Terminating TLS for a shared SNI route needs a certificate Caddy already holds for that hostname (a proxy host or managed certificate for the same name).
+- The `caddy-l4` wrapper makes Caddy log `tls is enabled, but listener wrapper returns a connection that doesn't implement connectionStater` once per connection; HTTPS and HTTP/2 were unaffected in testing.
+- Profiles cannot yet be set through the REST API.
+
+---
+
+## [2.60.0] - 2026-10-07 - Middleware profiles (#124) and a configurable fallback status (#123)
+
+Two features requested by @kernaxis (#124, also filed as #125) and @tkkost (#123).
+
+### Added
+
+- **Middleware profiles** — a new admin-only **Middleware Profiles** page. A profile bundles HTTP policy that many hosts share:
+  - **Security headers** — the standard bundle (HSTS, X-Content-Type-Options, X-Frame-Options, Referrer-Policy) plus X-Frame-Options, Referrer-Policy, Permissions-Policy and Content-Security-Policy values.
+  - **Forward auth** — auth URL, method, copied response headers, header prefix and skip paths (works with the v2.59.5 generator).
+  - **IP restrictions** — an allowlist and a blocklist (IP addresses or CIDR ranges, IPv6 included).
+  - **Extra headers** — request and response header maps.
+  Pick a profile on a proxy host (the **Middleware profile** selector; step 3 of the guided publish flow, always visible in the advanced editor). **A value set on the host itself wins** over the profile; empty host fields inherit it; forward auth is taken as one unit (a host with its own auth URL keeps only its own settings); the two header maps merge by name with the host winning. The profile is applied when the Caddy config is built — **the host row is never rewritten**, so detaching a profile restores exactly what the host had.
+- **Editing a profile re-syncs every server that has a host using it**, so a change reaches Caddy without re-saving each host. Profiles are global to the controller, so hosts on different fleet servers share one definition; a host deployed to a fleet target carries its profile with it, and changing or removing it on the source updates the copy.
+- A profile that is still attached to hosts **cannot be deleted** (the page says how many); deleting a host releases it. Cloning a host keeps its profile. Profile names are unique; entries are validated on save (URLs, CIDRs, header names and values).
+- **Configurable fallback status** — **Settings → General → Fallback status code** (`400`–`599`, default `404`, blank = default). It is answered for a request that matches no proxy host, redirection or Advanced Route, on the HTTP **and** HTTPS servers and on the managed wildcard-certificate route, so every kind of unknown host behaves the same. *Custom 404 page HTML* is renamed **Custom fallback page HTML** and is sent with the chosen status (the stored setting is unchanged, so existing pages keep working).
+
+### Notes
+
+- Profiles are managed by administrators; any account that can edit a host can attach one. For a non-admin's host, the normal upstream guard still applies to the resulting route (for example a profile's forward-auth upstream may not point at a blocked address).
+- Not part of this first version: WAF / Coraza (needs a Caddy module that the published image does not include), and setting a profile through the REST API (UI only).
+- New tables `middleware_profiles` and `proxy_host_profiles` (created automatically on SQLite and MariaDB); nothing changes for a host until you attach a profile.
+
+---
+
+## [2.59.5] - 2026-10-07 - Forward Auth works now: `unknown module: http.handlers.forward_auth` (#124, #125)
+
+Reported by @kernaxis while asking for reusable middleware profiles (#124, duplicated as #125): saving a Proxy Host with a Forward Auth URL failed with `unknown module: http.handlers.forward_auth`.
+
+### Fixed
+
+- **Forward Auth never worked.** `forward_auth` is a Caddyfile *directive*, not a JSON handler module, and CaddyUI has emitted `{"handler":"forward_auth"}` since v2.9.27, so Caddy rejected the whole config for any host that used it. CaddyUI now generates exactly what the directive expands to (checked against Caddy's own `/adapt` output): a `reverse_proxy` to the auth service that rewrites the method and URI, passes `X-Forwarded-Method` / `X-Forwarded-Uri` and the original `Host`, and — on a 2xx answer only — copies the configured response headers onto the request that continues to the real upstream. A non-2xx answer (401/403/redirect to a login page) is relayed to the client by reverse_proxy's own behaviour.
+- **Copied headers cannot be spoofed.** Each copied header is deleted from the incoming request before the auth service's value is applied, and is only set when the auth service actually sent it, so a client can never supply `X-Authentik-Username` (or any other copied header) itself.
+- The existing options now do what their labels say: *Forward Auth Method*, *Copy auth headers*, *Headers prefix* (applied to the header name placed on the upstream request) and *Skip paths*.
+- The Forward Auth URL is validated when you save: it must be `http://` or `https://` with a host (for example `http://authentik:9000/outpost.goauthentik.io/auth/caddy`). If a stored URL is ever unusable, the host answers `503` instead of being served without authentication (fail-closed).
+- Because the auth service is now a real upstream, a non-admin account can no longer point Forward Auth at an address the upstream guard blocks (loopback, link-local/metadata, the Caddy admin API).
+- Verified end to end on a real Caddy 2.11 with a fake auth service: no cookie → `401` with the auth service's body; valid cookie → `200` and the upstream receives the copied header; a client-supplied copy of the header without valid auth → `401`; a skipped path reaches the upstream without an auth call; a prefix renames the copied header.
+
+### Notes
+
+- Upgrading fixes existing hosts on the next sync (restart with sync-on-start, or any save).
+- Reusable Forward Auth / middleware profiles (#124) are a feature request and are tracked for the next feature release.
+
+---
+
+## [2.59.4] - 2026-10-07 - Unknown hosts get a 404 instead of an empty 200 (#123)
+
+Reported by @tkkost: a request for a hostname that matches no Proxy Host, Redirection or Advanced Route got an empty `200 OK` over HTTP, while hosts under a managed wildcard certificate got a 404 over HTTPS.
+
+### Fixed
+
+- **Requests that match no host now always get `404 Not Found`, on both the HTTP (`:80`) and HTTPS (`:443`) server.** CaddyUI only generated a fallback route when custom 404 page HTML had been saved in Settings; otherwise Caddy's default for "no route matched" — an empty 200 — applied (reproduced on a real Caddy 2.11: unknown host → `200`, `Content-Length: 0`, on both listeners; the HTTPS 404 reported came from the managed-certificate route, which exists only on `:443` for the wildcard's own hosts). The fallback is now generated whenever the server has routes: the custom HTML when configured (unchanged: status 404), otherwise Caddy's error handler, which shows CaddyUI's branded 404 page on HTTPS and a plain empty 404 on `:80`.
+- The fallback is always the **last** route. On `:80` it sits after the HTTPS-redirect route, so a Force-SSL host is still redirected rather than answered with the 404 — checked on a real Caddy together with an unknown host and a normal proxied host.
+- A server with no routes at all is left alone as before: no fallback is added and CaddyUI does not take over an empty listener.
+
+### Notes
+
+- This is a visible behaviour change: anything that relied on `http://<server-ip>/` or an unknown hostname answering `200` (an uptime check pointed at the bare IP, for example) now sees `404`. Point such checks at a real host, or add a host for them.
+- A configurable fallback status code and a generalised "custom fallback page" are tracked separately for the next feature release.
+
+---
+
+## [2.59.3] - 2026-10-07 - HTTP-only Advanced routes stay off HTTPS, and failed delete calls fixed (#121)
+
+Reported by @tkkost: an Advanced Route written as `http://127.0.0.1 { respond /health "OK" 200 }` was also generated on the HTTPS listener, so Caddy served it over HTTPS and issued an internal certificate for `127.0.0.1`, which then showed up as a "Direct certificate" in the certificates view.
+
+### Fixed
+
+- **A route written with explicit `http://` addresses is now generated only on the plain `:80` server.** v2.58 stopped such a route from asking for a certificate or forcing HTTPS on save, but CaddyUI still copied it onto `:443` (every non-forced Advanced Route goes on both listeners). The HTTPS side — its routes, certificate skip list and DNS-01 certificate policies — now leaves them out, so the route is not reachable over HTTPS and Caddy no longer issues a certificate for its host. This is applied when the config is built, so existing routes are corrected by the next sync (a restart with sync-on-start, or any save) with no migration. Verified on a real Caddy: the route appears on `caddyui_http` only and no TLS policy mentions the host.
+- An `http://` route that an older save left with **Force SSL** on is no longer turned into a redirect to HTTPS on `:80`; it is served as written.
+- **Three delete calls to Caddy's admin API were sent to `/config/config/...`**, which real Caddy answers with HTTP 500 ("invalid traversal path"). They were the removal of CaddyUI's `:80` server when no `:80` routes remain, the removal of a stale Advanced-route server that has its own port, and clearing the HTTP/3 restriction when it is switched off. Depending on the call that failed a sync or was silently skipped. Fixed once, in the client, which now accepts the path with or without the leading `/config`.
+
+### Notes
+
+- If one Advanced Route's Caddyfile mixes `http://` and `https://` (or plain) site addresses it is not treated as HTTP-only and stays on both listeners; put the `http://` sites in their own route.
+- A certificate Caddy already issued for such a host stays in Caddy's storage (and in the certificates view) until it is removed or expires; no new ones are requested.
+
+---
+
+## [2.59.2] - 2026-10-06 - Code-scanning clean-up (no behaviour change)
+
+### Security
+
+- Two CodeQL `go/clear-text-logging` alerts (high) are closed. Two log lines — the import path skipping a proxy host the non-admin upstream guard refuses, and the sync-time tenant route guard skipping a non-admin-owned route — included a reason string that is derived from a generated route, and CodeQL traced a proxy host's API-key value into it. The reasons only ever contained handler names, upstream addresses or placeholder text, never the stored key, so nothing was leaked; but they no longer appear in the log. The log now says the route was refused and names the resource; the full reason is still shown as a form error when the owner saves the resource. No behaviour change.
+
+---
+
+## [2.59.1] - 2026-10-06 - Deleting the last resource now clears the live Caddy (#120)
+
+Reported by @tkkost right after v2.59.0: when deletion propagation removed the **last** host from a target, the resource disappeared from CaddyUI but its route stayed live in that Caddy.
+
+### Fixed
+
+- **The last proxy host, redirection or advanced route on a server was never removed from the live Caddy.** CaddyUI refuses to push a configuration when it holds no entries for a server (so a fresh or wiped database can never blank a live Caddy), and that guard also swallowed the sync after an explicit deletion — the database was empty, Caddy kept serving the old route. Reproduced on a real Caddy 2: after deleting the only host, a normal sync left both routes live. Deletions now sync with an explicit "empty is intended" switch, so the live config converges to the database. This applies to the target of a **propagated deletion** (v2.59.0) and equally to deleting the last resource by hand — the delete buttons, the bulk-delete actions and the REST API.
+- The guard itself is unchanged: ordinary syncs (startup sync, auto-sync, any save) still refuse to push when there are no entries, and a regression test keeps it that way.
+- The server form no longer says a target left empty keeps its last live routes.
+
+---
+
+## [2.59.0] - 2026-10-06 - Opt-in deletion propagation to automatic deployment targets (#120)
+
+Requested by @tkkost as a follow-up to v2.57.0: let the source server act as the desired state for its **Automatic deployment targets**, deletions included.
+
+### Added
+
+- **Propagate deletions to automatic deployment targets** — a checkbox in the *Automatic deployment targets* section of a Caddy Fleet entry (**off by default**; nothing changes until an administrator ticks it). When on, deleting a **proxy host**, **redirection**, **advanced route** or **Layer4 proxy** on that server deletes the paired copies CaddyUI previously deployed from it to its automatic targets. This covers the single-delete button, the bulk-delete actions and the REST API.
+- **It deletes only what it deployed.** Target-local resources, rows created independently on a target (that were never paired), copies on one-off **Also deploy to** servers that are not automatic targets, and a target row that another source resource is still paired with are all left alone. The deletion removes the copy from the target the same way deleting it there by hand would (including its managed DNS record) and then re-syncs that target's Caddy.
+- **Unreachable targets converge later.** If a target's Caddy can't be reached (or its sync is held), the deletion is kept as a *pending deletion* — the pairing is not forgotten — and retried every minute in the background until the target has converged. Pending deletions are listed on the source server's edit page with the attempt count and last error, **Retry now**, and **Discard** (admin-only; for a target that is gone for good). They are also recorded in the Activity Log.
+- New table `fleet_pending_deletions` and column `caddy_servers.propagate_deletions` (created automatically on SQLite and MariaDB); deleting a server drops its pending entries.
+
+### Changed
+
+- Deleting a source resource now always forgets that resource's pairings (previously they lingered, so a reused row ID could inherit one), whether or not propagation is on. The Layer4 delete confirmation only says "copies were not removed" when propagation is off.
+
+### Notes
+
+- A copy that was *adopted* by an earlier deployment (a target row with the same identity that the deployment then overwrote) counts as paired and is deleted too.
+- Certificates keep their own per-certificate targets and are not part of this.
+- As with any CaddyUI sync, a target left with **no** hosts at all is not pushed an empty config, so its last live routes stay until something else is configured there.
+
+---
+
+## [2.58.0] - 2026-10-06 - Layer4 Proxies: a dedicated section for TCP/UDP proxies (#122)
+
+Suggested and thoroughly tested by @tkkost. Until now Layer4 meant pasting a raw `layer4 { ... }` block into a server's edit form. Layer4 proxies are now first-class resources, managed like Proxy Hosts.
+
+### Added
+
+- **Layer4 Proxies** (new sidebar entry, admin-only). Each proxy has a **name**, **protocol** (TCP or UDP), **listen address** (optional) and **port**, **upstream host** and **port**, an **enabled** switch, a **node-local** switch and notes. CaddyUI generates the `caddy-l4` configuration (`apps.layer4.servers.caddyui_l4_<id>`) and pushes it to the server selected in the top bar; per-proxy create, edit, enable/disable and delete. A Caddy that lacks the `caddy-l4` module rejects the config at validation time, so a proxy it cannot run is never saved — use `applegater/caddyui-caddy`, which includes the module.
+- **Fleet behaviour like Proxy Hosts.** A saved proxy (and a quick enable/disable) is mirrored to the source server's **Automatic deployment targets** plus any one-off **Also deploy to** picks. A **node-local** proxy never leaves its server. Copies are idempotent and tracked in the same mapping table as hosts; a target that already has a proxy on the same protocol and listen socket adopts it instead of duplicating. **Sync from current** now carries Layer4 proxies too. As with hosts, **deleting a proxy does not delete its copies** on other servers.
+- Safety checks: ports 80, 443 and 2019 are refused (they belong to Caddy), the same protocol + socket cannot be used twice on a server, hostnames are validated, and `{env.}` / `{file.}` style placeholders are not accepted as upstreams. TCP and UDP can share a port number.
+
+### Compatibility
+
+- The raw **Layer4 app** Caddyfile editor is unchanged and stays under **Caddy Fleet → edit server** (the new page links to it as the Advanced / raw mode). Both feed the same `apps.layer4`: CaddyUI merges the managed `caddyui_l4_*` servers into whatever the raw block produces, so existing raw configurations keep working untouched.
+- Removing the last proxy (or disabling every one) on a server clears the generated servers from Caddy on the next sync.
+- New table `layer4_proxies` (created automatically on SQLite and MariaDB); deleting a server also deletes its proxies.
+
+### Fixed
+
+- The test fixture for the Caddy admin API matched the layer4 `DELETE` on the wrong path, so clearing `apps.layer4` was never exercised; the real path is now covered.
+
+---
+
+## [2.57.1] - 2026-10-06 - Security hardening release, Caddy 2.11.7, and #121
+
+A full security audit — independent reviews of authentication and authorization, of injection / SSRF / file access, and of secrets and data exposure, plus a manual review of the paths that turn user input into Caddy config — found a number of access-control and isolation gaps. **None was externally reported**; each was reproduced against the real router before being fixed, and every fix ships with a regression test that fails on the previous code. Most of them need a signed-in account below admin, so a single-operator install with no extra users is much less exposed than a multi-user one — but anyone running **user** or **view** accounts should upgrade. Admin behaviour is unchanged.
+
+### Security
+
+**Access control**
+
+- **Any role could read the live Caddy config, which contains certificate private keys and DNS API tokens.** `/caddy-config`, Import from Caddy (`/import`) and the snapshot list / download sat in the read-for-any-role group, so a read-only viewer could read every uploaded certificate's private key and the DNS provider tokens. They, with **snapshot upload / restore / delete** and the auto-snapshot setting (a customer-level user could upload arbitrary JSON and restore it to take over Caddy) and the Porkbun certificate import (which fetched private keys for any domain on the admin's Porkbun account), are now **admin-only**.
+- **A customer-level `user` account could download the whole database** (`/backup`: password hashes, TOTP secrets, every stored credential). It sat in the `requireWrite` group, which blocks only read-only viewers. Now admin-only.
+- **`GET /api/v1/certificates` returned `key_pem` for every shared certificate to every role**, including read-only API tokens. Private keys and file paths are now returned only to a browser session or full-scope token of someone who can manage that certificate.
+- **Missing per-row ownership checks** on the single-host export (`export.json` / `export.caddyfile`, which carry upstream basic-auth and API-key secrets), maintenance toggle, health page and expectation runner, and on certificate inspect. Any account could read or change another tenant's host by ID.
+- **API token scope was enforced only inside one route group**, so a `proxy_write` token could create a full-scope token, create an admin account and change settings. Scope is now enforced for every route, and API tokens cannot manage API tokens.
+- **A customer's fleet copy could overwrite another tenant's (or the admin's) host on a target server** by saving a host with the same domain and ticking *Also deploy to* — it adopted the unrelated row and reset its owner. A copy of a tenant-owned row now only updates the row CaddyUI created for it. Certificate export to a directory, certificate source-push and copying certificates between servers are admin-only.
+- **REST create/update and the JSON import skipped the duplicate-domain check** the UI enforces (a duplicate sorts first and hijacks the existing host's traffic). The import also trusted uploaded DNS record / zone / certificate ids — a crafted record id made deleting the host delete that DNS record with the admin's credentials. A non-admin can no longer reference another tenant's private certificate id.
+- Low-privilege roles saw other tenants' data: live traffic and its stream, the activity log and its CSV, the dashboard's recently-edited widget, every node's admin URL (`/api/v1/servers`) and the upstream list. All are now scoped to what the user may see. Helper endpoints that fetch or adapt user-chosen input (`test-upstream`, `preview`, `validate`) and the AI chat (which spends the admin's LLM key) now need a write-capable account.
+
+**Config injection by non-admin users (the "tenant route guard")**
+
+- **`{env.NAME}` and `{file./path}` in any tenant-controlled string are expanded by Caddy at request time** (verified on a real Caddy 2.11): a custom header, redirect target or static-response body could serve the Caddy process's environment — the shipped compose puts the DNS API token there — or any file the Caddy container can read, including its certificate storage. Caddyfile `{$ENV}` does the same while adapting, and an `import /path` reads files (a parse error echoes its first token).
+- Existing guards covered individual fields on individual paths, and each audit found another miss (Advanced routes, additional upstream rules, forward-proxy / forward-auth URLs, the redirection advanced JSON). A single guard now inspects the **generated Caddy route** for every non-admin-owned resource, at save time (clear error) and again when the config is built (enforcement for rows already stored, or saved by any path — UI, REST, import, AI tool, clone): blocked upstreams, `file_server` / `templates` / `acme_server`, dynamic upstreams and process-reading placeholders are refused or neutralised. Caddyfile text from a non-admin is refused *before* it is sent to Caddy. The upstream guard also now understands `tcp/` prefixes, unix sockets, placeholders and integer / hex IP forms, blocks more cloud-metadata addresses, and treats **every registered node's** admin API as off limits, not just the primary's.
+- CaddyUI's own probes build URLs from a host's first domain and a custom health check: a customer could set the domain to `10.8.0.2:2019` with a custom `POST` check and have CaddyUI send it to that address every minute. Non-admin domains must now be plain hostnames, custom checks are GET / HEAD only, and the direct upstream probe no longer follows redirects.
+
+**Authentication**
+
+- **The login lockout never fired**: it counted a column the failed-login row doesn't write to. `max_login_attempts` now works. Wrong two-factor codes are limited (5 per login attempt, and an account with 10 recent failures cannot start a new second-factor step — keyed on the account, so a shared proxy address cannot lock everyone out).
+- A password change or reset now signs the account out everywhere (the profile change keeps only the current browser); disabling 2FA or regenerating backup codes needs the current password; first-run setup is serialized (two simultaneous requests could create two admins) and enforces the 8-character minimum server-side.
+- Password-reset and invitation links were built from the request's `Host` header, so an unauthenticated request with a forged Host got a working reset link mailed to the victim. Links now use **`CADDYUI_PUBLIC_URL`**, else your OIDC redirect URL's origin; set it to close this completely.
+
+**Data exposure, hygiene and stability**
+
+- The request log no longer records query strings (reset and invite tokens, a newly created API token, pending 2FA tokens and the OIDC code all travel there); webhook / ntfy URLs and `CADDY_ADMIN_URL` passwords are redacted from other log lines. CSV exports neutralise spreadsheet formulas. Server data written into `innerHTML` is escaped (certificate names and upstream addresses are tenant-controlled). LIKE wildcards in host matching are escaped (a host of `*.%` matched everything). New password hashes use bcrypt cost 12, as `SECURITY.md` always said (existing hashes keep working).
+- **`syncCaddy` swapped a shared client for its whole duration**, so concurrent syncs of different servers pushed each other's routes — certificate keys and basic-auth hashes included — to the wrong node (52 and 72 cross-pushes in 40 iterations in a reproduction). Syncs are now serialized.
+
+### Fixed
+
+- **An explicit `http://` Advanced route no longer needs a certificate or an HTTPS wait** ([issue #121](https://github.com/X4Applegate/caddyui/issues/121)): a route written as `http://127.0.0.1 { … }` now drops its certificate and Force SSL on save, skips the "deploying" page that waited for an ACME certificate that never comes, and the form disables both controls with an explanation. Reported by @tkkost.
+
+### Changed
+
+- Bundled **Caddy 2.11.7** (2.11.6 carries security fixes — a `forward_auth` / `reverse_proxy` upstream-connection mix-up (GHSA-6365-7ppr-5r92), path canonicalisation for `handle_path` / `uri strip_*`, `path_regexp` backslash normalisation — and 2.11.7 fixes regressions from 2.11.6). **Go toolchain 1.26.8**, `go-jose` 4.1.5 and other dependency updates; `govulncheck` finds no affected vulnerabilities. If you run your own Caddy, update it too — the image you pull for CaddyUI's Caddy is rebuilt with these.
+
+### Upgrade notes
+
+- **Non-admin accounts:** routes that use `{env.…}` / `{file.…}` placeholders, `file_server`, or an internal upstream are no longer deployed (the save is refused with a reason; an already-stored route is skipped or neutralised at sync and logged as `route skipped`). Read-only accounts lose snapshots, the live config view and the AI chat; user accounts lose the pages listed above. Admins are unaffected.
+- Set `CADDYUI_PUBLIC_URL` if you use password reset or invitations.
+- Passwords are re-hashed at cost 12 only when next changed.
+
+### Not addressed here (tracked)
+
+Admin-reachable and hardening items found by the same audit and deliberately left for a follow-up: the Tailwind CDN script on authenticated pages (and the `unsafe-inline` / `unsafe-eval` policy that follows from it); the unauthenticated log-ingest TCP listener on `:9019` (documented as relying on network isolation); DNS-rebinding of upstream host names (the guard is config-time); OIDC account linking by verified email only (no `iss`+`sub` binding or PKCE); upstream TLS verification being off by default for `https://` upstreams; the SMTP STARTTLS downgrade; rate limiting on `/forgot-password`; request-body size limits on JSON endpoints; an optional first-run setup token; per-tenant isolation of the post-sync "expectations" auto-rollback (one tenant's failing check can roll back the whole server's config); and AI-chat error bodies being read unbounded.
+
+---
+
+## [2.57.0] - 2026-10-06 - Automatic deployment targets for Caddy Fleet servers
+
+### Added
+
+- **Persistent default deployment targets** ([issue #120](https://github.com/X4Applegate/caddyui/issues/120)): the per-save **Also deploy to** picker only applied to the save it was ticked on, so a fleet where one Caddy is the configuration source for a fixed set of edge nodes had to re-select the same servers on every create and edit. A Caddy Fleet server's edit form now has an **Automatic deployment targets** section: tick the servers it feeds, and every proxy host, redirection and advanced route created or edited on that server in the web UI — by any user who can save there — is deployed to them on save. It uses exactly the same per-resource deployment as **Also deploy to** — idempotent, hostname changes stay attached to the right copy through the durable source-to-target mapping, target DNS records and custom certificate selections remain server-specific, and a managed wildcard certificate definition that covers the host travels with it — so nothing new has to be learned about how a deployment behaves. On the resource forms the targets appear as always-on rows labelled *default*; the **Also deploy to** picker stays available for one-off extra targets, and marking a resource **node-local** is the per-resource opt-out. Independent of the Layer4 **Also copy to** picker on the same server form, which has its own field. **Off by default and fully additive:** every existing server starts with no targets, so nothing deploys anywhere new until an operator picks some. Deleting a server also removes it from every other server's target list, so a reused ID can never start receiving another server's resources. **Deliberately not included:** deleting a resource does not delete its copies on the targets (propagating deletions is destructive, so it is left for an explicit opt-in); quick enable/disable toggles, bulk actions, Caddyfile and JSON import, and the REST API do not deploy; certificates keep their own per-certificate targets; and resources that already exist are deployed the next time they are saved — for a one-time bulk copy use **Sync from current** on the target. Deployment still happens as part of the save, exactly like **Also deploy to**, so a target that is unreachable can delay a save by up to ~10 seconds (the failure is recorded in the Activity Log); targets run one way, from the source to its edge nodes — a server that already deploys to this one cannot be added as its target, so two servers can never overwrite each other. Regression tests drive the real create and edit handlers for proxy hosts, redirections and advanced routes. Requested by @tkkost.
+
+---
+
+## [2.56.4] - 2026-10-06 - Fix: proxy host Advanced config could not import CADDYFILE_PATH snippets
+
+### Fixed
+
+- **`import <snippet>` in a proxy host's Advanced config was rejected with `File to import not found`** ([issue #119](https://github.com/X4Applegate/caddyui/issues/119)): snippet definitions — `(my_snippet) { ... }` — in the Caddyfile mounted at `CADDYFILE_PATH` were auto-loaded for Advanced routes and the Caddyfile paste importer, but a proxy host's own **Advanced config** was adapted without them, so a valid snippet in the mounted file could not be imported there and the save was refused with Caddy's error. All three paths now share a single snippet loader, so they can't drift apart again. As before, only `(name) { ... }` blocks are taken from the file — never its global options or site blocks — and a snippet the text defines itself wins over the mounted one. The `CADDYFILE_PATH` rows in the README and Docker Hub docs now describe this instead of calling it a paste-import reference only. Regression tests added (they fail without the fix, with the exact error from the report) and the fix was also confirmed against a real Caddy 2.11.4. Reported by @kernaxis.
+
+---
+
+## [2.56.3] - 2026-10-05 - Multi-arch Docker images (linux/amd64 + linux/arm64)
+
+### Changed
+
+- **`applegater/caddyui` and `applegater/caddyui-caddy` are now published as multi-arch images** ([issue #115](https://github.com/X4Applegate/caddyui/issues/115) follow-up): every tag (`:vX.Y.Z`, `:stable`, `:latest`) is now a manifest list covering `linux/amd64` and `linux/arm64`, so `docker pull` on an arm64 host (Raspberry Pi, Ampere, Graviton, Apple Silicon) no longer fails with `no matching manifest for linux/arm64`. Previously only the GitHub release archives had an arm64 build; the Docker images were amd64-only, which blocked arm64 edge nodes in a fleet from running the container at all. The `Dockerfile` and `Dockerfile.caddy` now build on the builder's native platform and cross-compile for the target (`GOOS`/`GOARCH`), so no QEMU emulation is involved and one `docker buildx build --platform linux/amd64,linux/arm64` produces both. The CaddyUI `Dockerfile` now also runs `go test ./web/` before compiling, so a builder that drops embedded `web/static/` assets fails the image build instead of shipping a UI that 404s on its font and stylesheet (issue #37). The old note that multi-arch builds were blocked by a BuildKit embed bug no longer reproduces and has been removed. No change to application behavior; amd64 users are unaffected.
+
+---
+
+## [2.56.2] - 2026-10-05 - Security: closed 4 more SSRF-guard gaps and 2 clone-IDOR gaps
+
+### Security
+
+- **Four more proxy-host creation paths skipped the non-admin upstream SSRF guard ([GHSA-r4wm-rgc5-q834](https://github.com/X4Applegate/caddyui/security/advisories/GHSA-r4wm-rgc5-q834) follow-up):** auditing every proxy-host creation path after v2.56.1's AI-exec-tool fix turned up four more that predate `validateProxyUpstreamsForUser` (added in v2.52.2) and were never updated to call it: uploading a JSON file via **Proxy Hosts → Import**, **Import from Caddy** (pulls the live config and classifies it), pasting a Caddyfile block via **Caddyfile Import**, and reclassifying an existing raw route into a proxy host when the classifier improves. All four are reachable by any non-admin write-capable account and could previously create a proxy host pointed at the Caddy admin API, loopback, or link-local/cloud-metadata addresses. Fixed by applying the same guard every REST and form path already enforces.
+- **Clone endpoints were missing the ownership check every other access to the same resource enforces:** a non-admin account could clone — and thereby read the full configuration of, including upstream and advanced config — any other tenant's or the admin's proxy host or redirection host, simply by guessing its ID in `/proxy-hosts/{id}/clone` or `/redirection-hosts/{id}/clone`. Fixed with the same `canManageOwned` ownership check used on every other access to these resources.
+
+Both found during an internal audit, not externally reported. Regression tests added for all six.
+
+---
+
+## [2.56.1] - 2026-10-05 - Security: AI tool-calling endpoint enforced write-role and SSRF guard
+
+### Security
+
+- **Read-only viewers could create proxy hosts and redirections via the AI tool-calling endpoint ([GHSA-5h8j-xxm3-7ggr](https://github.com/X4Applegate/caddyui/security/advisories/GHSA-5h8j-xxm3-7ggr)):** `POST /api/ai/exec-tool` was registered outside the `requireWrite`-protected route group that every other mutating route lives in, so an authenticated `viewer`-role account could call it directly and persist a new proxy host or redirection despite being explicitly blocked from every normal write path. The same handler's `create_proxy_host` action also skipped `validateProxyUpstreamsForUser`, the non-admin upstream guard added for GHSA-r4wm-rgc5-q834 — a non-admin account could use the AI tool as a side channel to point a proxy at the Caddy admin API, loopback, or link-local/cloud-metadata addresses even though the normal creation paths already block exactly that. Both gaps are closed: the route now lives in the same `requireWrite` group as every other mutating endpoint, and `create_proxy_host` now runs the same SSRF validation the REST and form paths already enforce. **Anyone running multi-user CaddyUI with `viewer` accounts and the AI assistant enabled should upgrade.** Reported by Sanidi Peiris ([@sanidipeiris-alt](https://github.com/sanidipeiris-alt)) and Sithum Shihara ([@zaara2004](https://github.com/zaara2004)).
+
+---
+
+## [2.56.0] - 2026-10-05 - Layer4 app support for TCP/UDP routing
+
+### Added
+
+- **Per-server layer4 app support** ([issue #113](https://github.com/X4Applegate/caddyui/issues/113)): Caddy servers running [`caddy-l4`](https://github.com/mholt/caddy-l4) — TCP/UDP-level routing such as SNI/protocol multiplexing and raw proxying — can now paste a complete `layer4 { ... }` Caddyfile block, including the wrapper, into a new field on the Caddy server edit form. CaddyUI sends it to that server's own admin API `/adapt` endpoint and merges only the resulting `apps.layer4` subtree into the config it pushes on every sync; any other key the paste happens to adapt to is discarded, so pasting something unrelated can't contaminate the rest of the config. The block is checked against the server's own admin API immediately when the form is saved — a typo, or a Caddy build without the `caddy-l4` module, is refused by the pre-save validation with Caddy's own error, instead of silently breaking the server's next scheduled sync. A server dedicated entirely to layer4 routing (no proxy hosts, redirects, raw routes, or certificates of its own) now syncs normally rather than being refused by the "nothing to push" guard. The same text can be copied to other fleet members via an **Also copy to** picker — the same UX family as the existing "Also deploy to" pickers — with each target validated against its own admin API independently, so a target whose Caddy build lacks the module is skipped rather than silently broken on its next sync. This pass intentionally covers layer4 specifically, not general Caddyfile global-options support (snippets, `trusted_proxies`, and the rest) — see the issue thread for why a fully general "paste any global option" box isn't safe on top of CaddyUI's generated server blocks. Empty by default on every existing server, so this is fully additive. Requires a Caddy build with `caddy-l4` compiled in — the published [`applegater/caddyui-caddy`](https://hub.docker.com/r/applegater/caddyui-caddy) image now includes it. Regression tests in `layer4_test.go`. Requested by @BenRLange.
+
+---
+
+## [2.55.0] - 2026-10-05 - Share one managed ACME certificate across fleet nodes
+
+### Added
+
+- **Opt-in "source push" fleet distribution for Managed ACME certificates** ([issue #115](https://github.com/X4Applegate/caddyui/issues/115)): the "Also configure on" picker on a Managed ACME certificate previously only cloned the DNS-01 *definition* to each target server, so every target independently obtained and renewed the same certificate — multiplying ACME orders against the CA's rate limits and requiring DNS API credentials on every edge node, for fleets that just want one shared wildcard. A new **"Push this certificate instead of letting each server obtain its own"** toggle (shown once a Managed ACME certificate has at least one target checked) switches selected targets to receiving the source's actual certificate and private key instead: the source server still performs the ACME order, and CaddyUI pushes the resulting PEM to the targets through the existing PEM fleet-copy machinery, so they need no DNS credentials and get no `apps.tls.automation.policies` entry of their own. Renewals are picked up automatically by the certificate lifecycle reconciler (within about an hour) without re-saving the certificate form; a first push attempted before the source has completed its own ACME order is skipped and simply retried on the next pass rather than pushing an empty certificate. Requires the source server's **Data directory** to be set (the same prerequisite as the existing "Export to a directory" feature), since reading a private key needs direct access to Caddy's on-disk certificate storage — a live TLS probe can only ever reveal the public certificate, never the key. **Off by default and fully additive:** every certificate that doesn't explicitly opt in keeps today's independent-ACME behavior with no change. Requested by @tkkost.
+
+---
+
+## [2.54.0] - 2026-10-05 - Configurable ACME DNS-01 resolver
+
+### Added
+
+- **Configurable DNS resolver for Caddy's own ACME DNS-01 challenge** ([issue #116](https://github.com/X4Applegate/caddyui/issues/116)): Caddy's DNS-01 solver checks TXT-record propagation using the container's default resolver, which breaks split-horizon DNS setups where the same zone is served privately inside the network and publicly (e.g. via Cloudflare) for ACME validation — the internal resolver returns the private view and the propagation check never sees the record it just created. **Settings → DNS → ACME DNS-01 resolvers** now points Caddy's propagation checks at public or otherwise-reachable resolvers (comma-separated `host:port`, `:53` assumed, IPv6 as `[::1]:53`), independent of the existing "Verification resolver" setting, which only affects CaddyUI's own deploy/readiness checks. Applies to every DNS-01 automation policy — Managed DNS proxy hosts, redirects, raw routes, and managed certificates alike. Leave blank to keep using Caddy's own default resolver. Requested by @tkkost.
+
+---
+
 ## [2.53.0] - 2026-09-24 - Security: certificate file reads confined to allowlisted directories
 
 ### Security

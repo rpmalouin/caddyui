@@ -28,7 +28,7 @@ A modern, self-hosted web UI for [Caddy](https://caddyserver.com/) — manage pr
 docker pull applegater/caddyui:latest
 ```
 
-Current Docker images target `linux/amd64` and include SBOM/provenance attestations. The CaddyUI container runs non-root (UID 10001). Native Linux release archives remain available for both `amd64` and `arm64`.
+Docker images (`applegater/caddyui` and the companion `applegater/caddyui-caddy`) are multi-arch — `linux/amd64` and `linux/arm64` — so `docker pull` picks the right one for x86-64 servers and arm64 hosts (Raspberry Pi, Ampere, Graviton, Apple Silicon) automatically. They include SBOM/provenance attestations. The CaddyUI container runs non-root (UID 10001). Native Linux release archives are also available for both `amd64` and `arm64`.
 
 Docker remains the recommended install path, but tagged releases also include
 native Linux binary archives for `amd64` and `arm64` hosts. See the
@@ -58,6 +58,23 @@ run CaddyUI directly in an LXC, VM, or bare-metal host.
 ---
 
 ## Features
+
+### Fleet deployment, certificates, layer4 routing, and hardening in v2.53 – v2.65
+
+- **SSO roles from your IdP, and a recoverable admin allowlist** *(v2.65.0)* — accounts created on first SSO sign-in can take a configured **default role** instead of always landing read-only, or get one mapped from a **groups claim** with `group|role` rules (first match wins, case-insensitive, applied at creation only so nobody is demoted by signing in). The **admin panel IP allowlist** now matches the real visitor address behind a trusted proxy rather than the proxy itself — previously an allowlist naming your own address locked you out, and naming the proxy let everyone in — and **Settings → Security shows the address you are connecting from**, so an entry that would lock you out is visible before you save. If it happens anyway, `CADDYUI_ADMIN_ALLOWLIST` in your compose file overrides the stored list (`=off` disables the gate) without touching what you saved.
+- **Client certificate authentication (mTLS)** *(v2.64.0)* — a proxy host can require a certificate from the visitor, not just present one. Under **Proxy Hosts → edit → Security → Client certificate authentication**, pick a mode — *Require and verify* (the usual meaning of mTLS), *Verify if given*, or *Require* / *Request* for the cases where something behind Caddy does the checking — and list the trusted CA certificate files as Caddy sees them inside its own container. Caddy then refuses the TLS handshake unless the client presents a certificate signed by one of them, and your backend can read it through the usual placeholders (`SSL_CLIENT_CERT: {http.request.tls.client.certificate_der_base64}` under *Custom headers* for EJBCA and friends). A verifying mode with no trusted CA is refused at save time, because Caddy would accept it and then turn away everyone. Distinct from **Upstream mTLS Client Certificate**, which points the other way.
+- **Automatic deployment targets** *(v2.57.0)* — pick the servers a Caddy Fleet entry always feeds under **Caddy Fleet → edit server → Automatic deployment targets**, and every proxy host, redirection and advanced route you create or edit on that server in the web UI is deployed to them on save, instead of re-ticking **Also deploy to** every time. Built for a fleet where one Caddy is the configuration source for a fixed set of edge nodes; the resource forms show those servers as *default*, the per-resource picker stays for one-off extras, and **node-local** keeps a single resource off every other server. Deleting a resource does not delete its copies, and quick toggles, bulk actions, imports and the REST API don't deploy — use **Sync from current** for those. Off until you pick targets.
+- **Interface languages** *(v2.62.0)* — CaddyUI can now be shown in other languages: each person picks one under **Profile → Language** (or follows their browser), with a site-wide default under Settings. Translations are plain JSON files in `web/i18n/` with English as the source and the fallback for anything not yet translated, so a partial translation never breaks a page. The navigation, menus, list-page titles, the Dashboard, Profile and Settings › General are on the catalog *(v2.63.0)*; more of the interface follows release by release. Available: English and **简体中文 (Simplified Chinese)**, contributed by the community *(v2.62.1)*. Want to translate? See [docs/TRANSLATING.md](docs/TRANSLATING.md).
+- **Coraza WAF in middleware profiles** *(v2.61.0)* — switch on the [Coraza](https://coraza.io) web application firewall with the OWASP Core Rule Set for every host that uses a profile: **Detection only** (logs what it would block, blocks nothing — start here) or **Block** (403), paranoia level 1–4, optional custom SecLang directives. It runs first in the host's route, so an attack is refused before auth or the upstream. Needs a Caddy built with the Coraza module — the published `applegater/caddyui-caddy` image includes it from v2.61.0 — and CaddyUI checks every affected server before saving, so a Caddy without the module is refused up front instead of rejecting its whole config.
+- **Layer4 on a shared port** *(v2.61.0)* — a Layer4 proxy can ride a port that is already in use. Choose *Share the HTTPS / HTTP port* and match **TLS SNI** names, **SSH**, **RDP** or **PostgreSQL**: CaddyUI adds a [`caddy-l4` listener wrapper](https://github.com/mholt/caddy-l4/blob/master/docs/servers.md) to the HTTPS (`:443`) or HTTP (`:80`) server, so SSH for `ssh.example.com` can travel over 443 next to normal HTTPS. Everything that matches no shared proxy carries on to Caddy as before; SNI routes can pass the TLS connection through or terminate it. TCP only.
+- **Middleware profiles** *(v2.60.0)* — reusable bundles of HTTP policy, configured once under **Middleware Profiles** (admin-only) and picked on any number of proxy hosts: **security headers** (HSTS, X-Frame-Options, Referrer-Policy, Permissions-Policy, CSP), **forward auth** (Authentik, Authelia — URL, method, copied headers, header prefix, skip paths), **IP allowlist / blocklist** and **extra request/response headers**. A host-level value wins over the profile, empty host fields inherit it, and the header lists merge by name; the host row itself is never rewritten, so detaching a profile restores exactly what the host had. Editing a profile re-syncs every server that has a host using it, deployed copies on fleet targets follow the same profile, and a profile in use cannot be deleted. Needs no extra Caddy module.
+- **Configurable fallback status** *(v2.60.0)* — **Settings → General → Fallback status code** (any `400`–`599`, default `404`) is answered for a request that matches no proxy host, redirection or Advanced Route, identically on HTTP and HTTPS (including hosts under a managed wildcard certificate). The old *Custom 404 page HTML* is now **Custom fallback page HTML** and is sent with the chosen status.
+- **Propagate deletions** *(v2.59.0, opt-in)* — a source server can also delete, not just create, what it deployed. Tick **Propagate deletions to automatic deployment targets** on its Caddy Fleet entry and deleting a proxy host, redirection, advanced route or Layer4 proxy there (UI, bulk or REST API) deletes only the paired copies on its automatic targets — never target-local rows, rows created independently on a target, or copies on one-off **Also deploy to** servers. An unreachable target keeps the deletion pending (shown on the server's edit page with **Retry now** / **Discard**) and CaddyUI retries every minute until that target converges. Off by default.
+- **Layer4 Proxies** *(v2.58.0)* — a dedicated, admin-only section for TCP/UDP proxies (name, protocol, listen address/port, upstream host/port, enabled, node-local). CaddyUI generates the `caddy-l4` config and pushes it; proxies follow the same fleet behaviour as Proxy Hosts (automatic deployment targets, one-off **Also deploy to**, node-local opt-out; deleting does not remove copies). Requires a Caddy built with `caddy-l4` (`applegater/caddyui-caddy`). The raw block below stays available as the Advanced mode.
+- **Layer4 app support** *(v2.56.0)* — paste a complete `layer4 { ... }` block (TCP/UDP routing via [`caddy-l4`](https://github.com/mholt/caddy-l4): SNI/protocol multiplexing, raw proxying, and more) into a Caddy server's own edit form. CaddyUI adapts it through that server's admin API and merges only the resulting `apps.layer4` into the config it pushes, with fleet replication via **Also copy to**. The published `applegater/caddyui-caddy` image now includes the module.
+- **Share one managed ACME certificate across fleet nodes** *(v2.55.0)* — an opt-in toggle on a Managed ACME certificate's **Also configure on** picker lets one source server perform the ACME order while CaddyUI pushes the resulting certificate and private key to the other selected servers, instead of every node ordering and renewing its own. Avoids multiplying CA rate-limit usage and keeps DNS API credentials off edge nodes.
+- **Configurable ACME DNS-01 resolver** *(v2.54.0)* — **Settings → DNS → ACME DNS-01 resolvers** points *Caddy's own* DNS-01 propagation checks at specific DNS servers, for split-horizon setups where the same zone is served privately inside the network and publicly for ACME validation. Distinct from the Verification resolver below, which only affects CaddyUI's own deploy/readiness checks.
+- **Certificate reads confined to allowlisted directories** *(v2.53.0)* — a certificate or key path can no longer name an arbitrary file on the host; reads are confined to the database directory, every Caddy node's Data directory, conventional certificate locations, and any directory an admin explicitly adds under Settings → Security.
 
 ### Analytics, certificates and local services in v2.39 – v2.52
 
@@ -170,11 +187,11 @@ Use one DNS-01 wildcard across matching proxy hosts without exporting or copying
 
 1. Go to **Settings → DNS** and save credentials for your DNS provider.
 2. Go to **Certificates → New**, choose **Managed ACME (DNS-01)**, select that credential profile, and enter a subject such as `*.example.com`.
-3. If you manage multiple Caddy servers, select them under **Also configure on**. Each server performs its own ACME order and keeps its own private key.
+3. If you manage multiple Caddy servers, select them under **Also configure on**. By default each server performs its own ACME order and keeps its own private key. Since v2.55.0, ticking **Push this certificate instead of letting each server obtain its own** flips this: this server performs the ACME order and CaddyUI pushes the resulting certificate and key to the others instead — useful for avoiding CA rate limits or keeping DNS credentials off edge nodes.
 4. Leave matching proxy hosts on **Auto** TLS. CaddyUI detects the covering wildcard and prevents redundant exact-host certificate orders.
 5. Edit the managed certificate later to see live deployment, issuer, expiry, and renewal health for every configured server.
 
-Your Caddy build must include the matching `caddy-dns` provider module. The easiest path is the prebuilt **`applegater/caddyui-caddy`** image (all eight DNS providers, the CrowdSec bouncer and the rate-limit module); it's the published build of [`Dockerfile.caddy`](Dockerfile.caddy), which you can also build yourself. The stock `caddy:2-alpine` image does not include these modules.
+Your Caddy build must include the matching `caddy-dns` provider module. The easiest path is the prebuilt **`applegater/caddyui-caddy`** image (all eight DNS providers, the CrowdSec bouncer, the rate-limit module, the Coraza WAF, and `caddy-l4` for [layer4 app support](#fleet-deployment-certificates-layer4-routing-and-hardening-in-v253--v262)); it's the published build of [`Dockerfile.caddy`](Dockerfile.caddy), which you can also build yourself. The stock `caddy:2-alpine` image does not include these modules.
 
 ### Routing
 
@@ -194,7 +211,13 @@ Your Caddy build must include the matching `caddy-dns` provider module. The easi
 
 - **Remote Caddy management** — manage multiple Caddy instances from a single UI; switch with a dropdown. Edge hosts only need Caddy — no CaddyUI container required (see [Agent mode](#agent-mode-edge-only-caddy-no-caddyui))
 - **Per-server scoping** — proxy hosts, redirections, routes, and certificates are all scoped to the active server; cross-server conflicts can't happen
-- **Fleet sync and Also deploy to** — copy a whole environment, or one host, redirection, route or certificate, onto other nodes; node-local resources stay where they belong, and each node has its own public IP, log ingest target and data directory
+- **Fleet sync and Also deploy to** — copy a whole environment, or one host, redirection, route or certificate, onto other nodes; node-local resources stay where they belong, and each node has its own public IP, log ingest target and data directory; a source server can also list **automatic deployment targets** that every UI save is mirrored to
+- **Interface languages** *(v2.62.0)* — per-user language with English fallback; contribute a translation via [docs/TRANSLATING.md](docs/TRANSLATING.md)
+- **Coraza WAF** *(v2.61.0)* in middleware profiles, and **Layer4 on a shared port** (SSH/RDP/PostgreSQL beside HTTPS on 443)
+- **Middleware profiles** *(v2.60.0)* — reusable forward auth / security headers / IP restrictions / extra headers attached to many proxy hosts; **Configurable fallback status** for unmatched requests
+- **Propagate deletions** *(v2.59.0)* — opt-in deletion of paired copies on automatic deployment targets, with retry for unreachable nodes
+- **Layer4 Proxies** *(v2.58.0)* — managed TCP/UDP proxies in their own section, with fleet deployment like Proxy Hosts
+- **Layer4 app support** *(v2.56.0)* — a per-server `layer4 { ... }` Caddyfile block for TCP/UDP routing, replicated to other nodes via **Also copy to**
 
 ### Access control
 
@@ -319,10 +342,13 @@ services:
       - caddy_config:/config
     environment:
       CADDY_ADMIN: 0.0.0.0:2019
-    command: >-
-      mkdir -p /config/caddy;
-      [ -f /config/caddy/autosave.json ] || echo '{}' > /config/caddy/autosave.json;
-      exec caddy run --config /config/caddy/autosave.json --resume --adapter json
+    command:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /config/caddy
+        [ -f /config/caddy/autosave.json ] || echo '{}' > /config/caddy/autosave.json
+        exec caddy run --config /config/caddy/autosave.json --resume --adapter json
     networks:
       - caddyui
 
@@ -477,10 +503,13 @@ services:
     container_name: caddy
     restart: unless-stopped
     # --resume is required so admin-API pushes persist across Caddy restarts.
-    command: >-
-      mkdir -p /config/caddy;
-      [ -f /config/caddy/autosave.json ] || echo '{}' > /config/caddy/autosave.json;
-      exec caddy run --config /config/caddy/autosave.json --resume --adapter json
+    command:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /config/caddy
+        [ -f /config/caddy/autosave.json ] || echo '{}' > /config/caddy/autosave.json
+        exec caddy run --config /config/caddy/autosave.json --resume --adapter json
     ports:
       # Bind the admin API to your private tunnel IP (WireGuard / Tailscale).
       # Do NOT expose :2019 on a public interface.
@@ -510,7 +539,10 @@ edge.
 >
 > **Fresh install:** On first boot no `autosave.json` exists yet, so Caddy would
 > crash-loop. The `command` above seeds an empty `{}` config on first start so
-> Caddy comes up cleanly without any extra steps.
+> Caddy comes up cleanly without any extra steps. It has to run through
+> `/bin/sh -c` as shown: a plain `command: mkdir -p …; exec caddy …` has no shell
+> to interpret the `;`, so only `mkdir` would run and the container would exit
+> straight away.
 
 ---
 
@@ -524,7 +556,8 @@ edge.
 | `CADDYUI_LISTEN` | `:8080` | Listen address |
 | `CADDYUI_INGEST_LISTEN` | `:9019` | Structured Caddy log ingest for analytics, certificate lifecycle, and temporary runtime streams; set empty to disable all three |
 | `CADDY_ADMIN_URL` | `http://caddy:2019` | Caddy admin API base URL |
-| `CADDYFILE_PATH` | `/etc/caddy/Caddyfile` | Path to Caddyfile (optional) |
+| `CADDYFILE_PATH` | `/etc/caddy/Caddyfile` | Optional — path to a Caddyfile mounted into the CaddyUI container. Its `(name) { ... }` snippet definitions are auto-loaded so `import <name>` works in Advanced routes, Caddyfile paste import, and a proxy host's Advanced config; site blocks and global options in it are never used |
+| `CADDYUI_PUBLIC_URL` | _(empty)_ | Externally visible origin, e.g. `https://caddyui.example.com`. Used for the links in password-reset and invitation emails; without it the link is built from the request's `Host` header. |
 | `CADDYUI_SYNC_ON_START` | *(unset)* | Set to `1` to push DB state to Caddy on startup |
 
 ---
@@ -560,6 +593,8 @@ Configure under **Administration → Settings → Email (SMTP)**:
 Add additional Caddy instances under **Administration → Caddy Fleet**. Switch the active environment with the selector in the application shell. All proxy hosts, redirections, routes, and certificates are scoped per server.
 
 To deploy the selected environment's complete managed routing configuration to another Caddy, choose **Sync from current** on the target fleet row. The sync is a non-destructive merge: it creates missing proxy hosts, redirects, advanced routes, and managed certificate definitions; updates resources paired by earlier deployments; and leaves target-only resources in place. Target DNS records, custom certificate selections, ACME private keys, and uploaded private keys remain server-specific. Repeating either a full sync or an individual form's **Also deploy to** action is idempotent and does not create duplicate routes.
+
+To make one Caddy the standing configuration source for a fixed set of edge nodes, open the source under **Administration → Caddy Fleet → edit** and tick the servers under **Automatic deployment targets**. From then on every proxy host, redirection and advanced route created or edited on that server in the web UI is mirrored to those servers on save — the same idempotent per-resource deployment as **Also deploy to**, without re-selecting the targets each time. The resource forms list them as *default* (always on); the **Also deploy to** picker still adds one-off extra targets for a single save, and marking a resource **node-local** keeps it on this server only. This is separate from the Layer4 **Also copy to** picker on the same form. Deleting a resource does not delete its copies on the targets unless you opt in with **Propagate deletions to automatic deployment targets** on the same form (*v2.59.0* — see below). Quick enable/disable toggles on hosts, bulk actions, Caddyfile import and the REST API do not deploy; resources that already exist are deployed the next time they are saved, or in bulk with **Sync from current** on the target. Certificates keep their own per-certificate targets.
 
 Edge / remote hosts do **not** need to run a CaddyUI container — just Caddy with its admin API reachable over a private network (WireGuard, Tailscale, VPC). See [Agent mode](#agent-mode-edge-only-caddy-no-caddyui) for the minimal compose file.
 

@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -127,28 +128,37 @@ func (s *Server) newServerPage(w http.ResponseWriter, r *http.Request) {
 		"User":    s.currentUser(r),
 		"Target":  &models.CaddyServer{Type: models.CaddyServerTypeManaged},
 		"Section": "servers",
+		// v2.56.0 (issue #113): "Also copy to" for the layer4 Caddyfile field.
+		// No server ID exists yet, so nothing needs to be excluded besides 0.
+		"OtherServers": s.otherManagedServersExcept(0),
 	})
 }
 
 func (s *Server) createServer(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
 	c := &models.CaddyServer{
-		Name:          strings.TrimSpace(r.FormValue("name")),
-		AdminURL:      strings.TrimSpace(r.FormValue("admin_url")),
-		Type:          r.FormValue("type"),
-		Tags:          strings.TrimSpace(r.FormValue("tags")),
-		Version:       strings.TrimSpace(r.FormValue("version")),
-		AdminUsername: strings.TrimSpace(r.FormValue("admin_username")),
-		AdminPassword: r.FormValue("admin_password"),
-		IngestTarget:  strings.TrimSpace(r.FormValue("ingest_target")), // v2.37.0
-		DataDir:       strings.TrimSpace(r.FormValue("data_dir")),      // v2.42.0
+		Name:            strings.TrimSpace(r.FormValue("name")),
+		AdminURL:        strings.TrimSpace(r.FormValue("admin_url")),
+		Type:            r.FormValue("type"),
+		Tags:            strings.TrimSpace(r.FormValue("tags")),
+		Version:         strings.TrimSpace(r.FormValue("version")),
+		AdminUsername:   strings.TrimSpace(r.FormValue("admin_username")),
+		AdminPassword:   r.FormValue("admin_password"),
+		IngestTarget:    strings.TrimSpace(r.FormValue("ingest_target")),    // v2.37.0
+		DataDir:         strings.TrimSpace(r.FormValue("data_dir")),         // v2.42.0
+		Layer4Caddyfile: strings.TrimSpace(r.FormValue("layer4_caddyfile")), // v2.56.0 (issue #113)
+		// v2.57.0 (issue #120): persistent default deploy targets. Not
+		// "deploy_to" — on this form that is the layer4 "Also copy to" picker.
+		DefaultDeployTargets: s.parseDefaultDeployTargets(r, 0),
+		PropagateDeletions:   r.FormValue("propagate_deletions") != "", // v2.59.0 (issue #120)
 	}
 	renderErr := func(msg string) {
 		s.render(w, r, "server_form.html", map[string]any{
-			"User":    s.currentUser(r),
-			"Target":  c,
-			"Section": "servers",
-			"Error":   msg,
+			"User":         s.currentUser(r),
+			"Target":       c,
+			"Section":      "servers",
+			"Error":        msg,
+			"OtherServers": s.otherManagedServersExcept(0),
 		})
 	}
 	if c.Name == "" {
@@ -162,6 +172,16 @@ func (s *Server) createServer(w http.ResponseWriter, r *http.Request) {
 	if !isValidAdminURL(c.AdminURL) {
 		renderErr("Admin URL must start with http://, https://, or unix:///")
 		return
+	}
+	// v2.56.0 (issue #113): adapt the pasted layer4 block against this
+	// server's own admin API right now, so a typo or a Caddy build missing
+	// the caddy-l4 module surfaces here instead of silently breaking every
+	// sync of this server from now on.
+	if c.Layer4Caddyfile != "" {
+		if _, err := buildLayer4App(caddy.New(c.AdminURL, c.AdminUsername, c.AdminPassword), c.Layer4Caddyfile); err != nil {
+			renderErr("Layer4 Caddyfile rejected by Caddy: " + err.Error())
+			return
+		}
 	}
 	id, err := models.CreateCaddyServer(s.DB, c)
 	if err != nil {
@@ -177,6 +197,12 @@ func (s *Server) createServer(w http.ResponseWriter, r *http.Request) {
 			log.Printf("server create: certificate log monitoring: %v", err)
 		}
 	}()
+	// v2.56.0 (issue #113): copy the same layer4 Caddyfile text to any
+	// selected fleet targets, same "Also deploy to" UX family as proxy
+	// hosts/redirects/raw routes.
+	if deployTo := parseDeployTo(r); len(deployTo) > 0 {
+		s.crossDeployLayer4Caddyfile(s.currentUserEmail(r), id, c.Layer4Caddyfile, deployTo)
+	}
 	http.Redirect(w, r, "/servers", http.StatusSeeOther)
 }
 
@@ -187,10 +213,14 @@ func (s *Server) editServerPage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
+	pending, _ := models.ListFleetPendingDeletions(s.DB, id) // v2.59.0 (issue #120)
 	s.render(w, r, "server_form.html", map[string]any{
-		"User":    s.currentUser(r),
-		"Target":  c,
-		"Section": "servers",
+		"User":             s.currentUser(r),
+		"Target":           c,
+		"Section":          "servers",
+		"OtherServers":     s.otherManagedServersExcept(id), // v2.56.0 (issue #113)
+		"PendingDeletions": pending,
+		"Flash":            r.URL.Query().Get("flash"),
 	})
 }
 
@@ -209,8 +239,11 @@ func (s *Server) updateServer(w http.ResponseWriter, r *http.Request) {
 	existing.Tags = strings.TrimSpace(r.FormValue("tags"))
 	existing.Version = strings.TrimSpace(r.FormValue("version"))
 	existing.AdminUsername = strings.TrimSpace(r.FormValue("admin_username"))
-	existing.IngestTarget = strings.TrimSpace(r.FormValue("ingest_target")) // v2.37.0
-	existing.DataDir = strings.TrimSpace(r.FormValue("data_dir"))           // v2.42.0
+	existing.IngestTarget = strings.TrimSpace(r.FormValue("ingest_target"))       // v2.37.0
+	existing.DataDir = strings.TrimSpace(r.FormValue("data_dir"))                 // v2.42.0
+	existing.Layer4Caddyfile = strings.TrimSpace(r.FormValue("layer4_caddyfile")) // v2.56.0 (issue #113)
+	existing.DefaultDeployTargets = s.parseDefaultDeployTargets(r, id)            // v2.57.0 (issue #120)
+	existing.PropagateDeletions = r.FormValue("propagate_deletions") != ""        // v2.59.0 (issue #120)
 	// Password: if the form submitted a blank value AND the user didn't explicitly
 	// check the "clear password" box, keep the existing one. Protects against
 	// masked-field UX where the password isn't re-typed on every edit.
@@ -221,10 +254,11 @@ func (s *Server) updateServer(w http.ResponseWriter, r *http.Request) {
 	}
 	renderErr := func(msg string) {
 		s.render(w, r, "server_form.html", map[string]any{
-			"User":    s.currentUser(r),
-			"Target":  existing,
-			"Section": "servers",
-			"Error":   msg,
+			"User":         s.currentUser(r),
+			"Target":       existing,
+			"Section":      "servers",
+			"Error":        msg,
+			"OtherServers": s.otherManagedServersExcept(id),
 		})
 	}
 	if existing.Name == "" {
@@ -243,6 +277,23 @@ func (s *Server) updateServer(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// v2.56.0 (issue #113): validate against this server's own (possibly
+	// just-edited) admin URL/credentials before saving — see createServer.
+	if existing.Layer4Caddyfile != "" {
+		if _, err := buildLayer4App(caddy.New(existing.AdminURL, existing.AdminUsername, existing.AdminPassword), existing.Layer4Caddyfile); err != nil {
+			renderErr("Layer4 Caddyfile rejected by Caddy: " + err.Error())
+			return
+		}
+	}
+	// v2.57.0 (issue #120): two servers that each deploy to the other would
+	// overwrite one another's copies on every save — refuse the loop outright
+	// instead of leaving it to a warning in the form text.
+	for _, targetID := range existing.DefaultDeployTargetIDs() {
+		if t, err := models.GetCaddyServer(s.DB, targetID); err == nil && t.DefaultDeployTargetSet()[id] {
+			renderErr(fmt.Sprintf("%s already deploys to this server automatically. Pointing two servers at each other would make each save overwrite the other — remove %s from %s's targets, or untick it here.", t.Name, existing.Name, t.Name))
+			return
+		}
+	}
 	if err := models.UpdateCaddyServer(s.DB, existing); err != nil {
 		renderErr(err.Error())
 		return
@@ -256,7 +307,77 @@ func (s *Server) updateServer(w http.ResponseWriter, r *http.Request) {
 			log.Printf("server update: certificate log monitoring: %v", err)
 		}
 	}()
+	// v2.56.0 (issue #113): re-deploy the edited layer4 Caddyfile to any
+	// selected targets, mirroring the raw-route/proxy-host edit flow.
+	if deployTo := parseDeployTo(r); len(deployTo) > 0 {
+		s.crossDeployLayer4Caddyfile(s.currentUserEmail(r), id, existing.Layer4Caddyfile, deployTo)
+	}
 	http.Redirect(w, r, "/servers", http.StatusSeeOther)
+}
+
+// parseDefaultDeployTargets reads the server form's "default_deploy_targets"
+// checkboxes (v2.57.0, issue #120) and returns them as the stored
+// comma-separated ID list. Only existing managed servers other than selfID
+// survive, so a forged or stale ID can neither point a server at itself nor at
+// a monitoring-only or deleted server. IDs are stored ascending so re-saving an
+// unchanged form never rewrites the column.
+func (s *Server) parseDefaultDeployTargets(r *http.Request, selfID int64) string {
+	allowed := map[int64]bool{}
+	for _, srv := range s.otherManagedServersExcept(selfID) {
+		allowed[srv.ID] = true
+	}
+	var ids []int64
+	seen := map[int64]bool{}
+	for _, v := range r.Form["default_deploy_targets"] {
+		id, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		if err != nil || !allowed[id] || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return models.JoinServerIDs(ids)
+}
+
+// crossDeployLayer4Caddyfile copies the source server's pasted layer4
+// Caddyfile text to each target server's own Layer4Caddyfile field (v2.56.0,
+// issue #113). Unlike proxy/redirect/raw-route cross-deploy there is no
+// separate resource row to create — this sets the field directly on each
+// target CaddyServer row and re-syncs it. Each target is validated against
+// its OWN admin API before being written: fleet members can run different
+// Caddy builds, and a target without caddy-l4 compiled in is skipped (with
+// the reason logged to its activity log) rather than silently broken on its
+// next scheduled sync. Best-effort per target, matching crossDeployProxyHost
+// and crossDeployRawRoute — one bad target must not abort the others.
+func (s *Server) crossDeployLayer4Caddyfile(actor string, sourceServerID int64, caddyfileSrc string, serverIDs []int64) {
+	s.fleetDeployMu.Lock()
+	defer s.fleetDeployMu.Unlock()
+
+	for _, sid := range serverIDs {
+		_, target, err := s.validateFleetPair(sourceServerID, sid)
+		if err != nil {
+			log.Printf("cross-deploy layer4 target %d: %v", sid, err)
+			_ = models.LogActivity(s.DB, sourceServerID, actor, "layer4_cross_deploy", fmt.Sprintf("server:%d", sid), err.Error(), false)
+			continue
+		}
+		caddyCl := caddy.New(target.AdminURL, target.AdminUsername, target.AdminPassword)
+		if _, err := buildLayer4App(caddyCl, caddyfileSrc); err != nil {
+			log.Printf("cross-deploy layer4 target %d rejected: %v", sid, err)
+			_ = models.LogActivity(s.DB, sid, actor, "layer4_cross_deploy", "layer4", "rejected by Caddy: "+err.Error(), false)
+			continue
+		}
+		target.Layer4Caddyfile = caddyfileSrc
+		if err := models.UpdateCaddyServer(s.DB, target); err != nil {
+			log.Printf("cross-deploy layer4 target %d save: %v", sid, err)
+			_ = models.LogActivity(s.DB, sid, actor, "layer4_cross_deploy", "layer4", err.Error(), false)
+			continue
+		}
+		_ = models.LogActivity(s.DB, sid, actor, "layer4_cross_deploy", "layer4", "updated layer4 Caddyfile", true)
+		if err := s.syncCaddy(sid, false); err != nil {
+			log.Printf("cross-deploy layer4 sync server %d: %v", sid, err)
+		}
+	}
 }
 
 func (s *Server) deleteServer(w http.ResponseWriter, r *http.Request) {

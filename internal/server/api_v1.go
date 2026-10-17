@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/X4Applegate/caddyui/internal/models"
 	"github.com/go-chi/chi/v5"
@@ -38,16 +39,22 @@ func (s *Server) apiV1ListServers(w http.ResponseWriter, r *http.Request) {
 		if srv.LastContactAt.Valid {
 			lastContactAt = srv.LastContactAt.Time.UTC()
 		}
-		out = append(out, map[string]any{
+		entry := map[string]any{
 			"id":              srv.ID,
 			"name":            srv.Name,
-			"admin_url":       srv.AdminURL,
 			"type":            srv.Type,
 			"status":          srv.Status,
 			"version":         srv.Version,
 			"tags":            srv.TagList(),
 			"last_contact_at": lastContactAt,
-		})
+		}
+		// v2.57.1: a node's admin URL is the address of its admin API. Handing
+		// every node's to any account gave a tenant the exact targets for an
+		// upstream-guard bypass attempt (and SECURITY.md says it is not exposed).
+		if isAdminUser(cu) {
+			entry["admin_url"] = srv.AdminURL
+		}
+		out = append(out, entry)
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -72,6 +79,11 @@ type apiProxyHostInput struct {
 	CompressionEnabled     bool   `json:"compression_enabled"`
 	SecurityHeadersEnabled bool   `json:"security_headers_enabled"`
 	TLSMinVersion          string `json:"tls_min_version"`
+	// v2.64.0 (discussion #137): client certificate authentication (mTLS).
+	// On PATCH, "off" clears the mode — an empty string leaves it unchanged
+	// like every other field in this struct.
+	ClientAuthMode         string `json:"client_auth_mode"`
+	ClientAuthCAFiles      string `json:"client_auth_ca_files"`
 	MaintenanceMode        bool   `json:"maintenance_mode"`
 	MaintenanceMsg         string `json:"maintenance_msg"`
 	MaxRequestBodyMB       int    `json:"max_request_body_mb"`
@@ -121,6 +133,8 @@ func proxyHostToAPIMap(p *models.ProxyHost) map[string]any {
 		"compression_enabled":       p.CompressionEnabled,
 		"security_headers_enabled":  p.SecurityHeadersEnabled,
 		"tls_min_version":           p.TLSMinVersion,
+		"client_auth_mode":          p.ClientAuthMode,
+		"client_auth_ca_files":      p.ClientAuthCAFiles,
 		"maintenance_mode":          p.MaintenanceMode,
 		"maintenance_msg":           p.MaintenanceMsg,
 		"max_request_body_mb":       p.MaxRequestBodyMB,
@@ -160,6 +174,21 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// validateClientAuthInput rejects a client-certificate (mTLS) configuration
+// that Caddy would accept but that could not admit anyone: an unknown mode,
+// or a verifying mode with no trusted CA to verify against.
+//
+// v2.64.0 (discussion #137).
+func validateClientAuthInput(mode, caFiles string) error {
+	if !models.ValidClientAuthMode(mode) {
+		return fmt.Errorf("client_auth_mode %q is not valid: use request, require, verify_if_given, require_and_verify, or off", mode)
+	}
+	if models.ClientAuthModeVerifies(mode) && strings.TrimSpace(caFiles) == "" {
+		return fmt.Errorf("client_auth_mode %q verifies the client certificate, so client_auth_ca_files must list at least one trusted CA certificate file", mode)
+	}
+	return nil
 }
 
 // GET /api/v1/proxy-hosts
@@ -224,6 +253,10 @@ func (s *Server) apiV1CreateProxyHost(w http.ResponseWriter, r *http.Request) {
 	if inp.HealthCheckMethod == "" {
 		inp.HealthCheckMethod = "GET"
 	}
+	if err := validateClientAuthInput(inp.ClientAuthMode, inp.ClientAuthCAFiles); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	ph := &models.ProxyHost{
 		Domains: inp.Domains, ForwardScheme: inp.ForwardScheme,
 		ForwardHost: inp.ForwardHost, ForwardPort: inp.ForwardPort,
@@ -239,8 +272,10 @@ func (s *Server) apiV1CreateProxyHost(w http.ResponseWriter, r *http.Request) {
 			return inp.ExtraUpstreams
 		}(),
 		CompressionEnabled: inp.CompressionEnabled, SecurityHeadersEnabled: inp.SecurityHeadersEnabled,
-		TLSMinVersion:   inp.TLSMinVersion,
-		MaintenanceMode: inp.MaintenanceMode, MaintenanceMsg: inp.MaintenanceMsg,
+		TLSMinVersion:     inp.TLSMinVersion,
+		ClientAuthMode:    inp.ClientAuthMode,
+		ClientAuthCAFiles: inp.ClientAuthCAFiles,
+		MaintenanceMode:   inp.MaintenanceMode, MaintenanceMsg: inp.MaintenanceMsg,
 		MaxRequestBodyMB: inp.MaxRequestBodyMB, StickySessions: inp.StickySessions,
 		LBPolicy: inp.LBPolicy, UpstreamTimeoutSec: inp.UpstreamTimeoutSec,
 		CORSEnabled: inp.CORSEnabled, CORSOrigins: func() string {
@@ -275,6 +310,17 @@ func (s *Server) apiV1CreateProxyHost(w http.ResponseWriter, r *http.Request) {
 	ownerID := cu.ID
 	if cu.IsAdmin {
 		ownerID = 0
+	}
+	// v2.57.1: the UI refuses a domain another host or redirect already holds
+	// on this server; this path did not. Caddy keeps the first matching route
+	// and the newest row sorts first, so a duplicate silently hijacked the
+	// existing host's traffic.
+	if conflict, err := models.DomainsConflict(s.DB, serverID, ph.DomainList(), 0, 0); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "could not validate domains: "+err.Error())
+		return
+	} else if conflict != "" {
+		writeJSONError(w, http.StatusConflict, fmt.Sprintf("domain %q is already in use by another proxy or redirect on this server", conflict))
+		return
 	}
 	newID, err := models.CreateProxyHost(s.DB, serverID, ownerID, ph)
 	if err != nil {
@@ -332,6 +378,23 @@ func (s *Server) apiV1UpdateProxyHost(w http.ResponseWriter, r *http.Request) {
 	}
 	if inp.TLSMinVersion != "" {
 		existing.TLSMinVersion = inp.TLSMinVersion
+	}
+	// v2.64.0 (discussion #137): client certificate authentication. An
+	// omitted field means "leave unchanged" throughout this handler, so
+	// mTLS is switched off with the explicit mode "off" rather than "".
+	if inp.ClientAuthMode != "" {
+		if inp.ClientAuthMode == "off" {
+			existing.ClientAuthMode, existing.ClientAuthCAFiles = "", ""
+		} else {
+			existing.ClientAuthMode = inp.ClientAuthMode
+		}
+	}
+	if inp.ClientAuthCAFiles != "" && existing.ClientAuthMode != "" {
+		existing.ClientAuthCAFiles = inp.ClientAuthCAFiles
+	}
+	if err := validateClientAuthInput(existing.ClientAuthMode, existing.ClientAuthCAFiles); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	if inp.MaintenanceMsg != "" {
 		existing.MaintenanceMsg = inp.MaintenanceMsg
@@ -415,6 +478,13 @@ func (s *Server) apiV1UpdateProxyHost(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusForbidden, msg)
 		return
 	}
+	if conflict, err := models.DomainsConflict(s.DB, existing.ServerID, existing.DomainList(), existing.ID, 0); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "could not validate domains: "+err.Error())
+		return
+	} else if conflict != "" {
+		writeJSONError(w, http.StatusConflict, fmt.Sprintf("domain %q is already in use by another proxy or redirect on this server", conflict))
+		return
+	}
 	if err := models.UpdateProxyHost(s.DB, existing); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -448,12 +518,14 @@ func (s *Server) apiV1DeleteProxyHost(w http.ResponseWriter, r *http.Request) {
 	if ph.DNSRecordID != "" {
 		s.dnsDeleteRecord(ph.DNSProvider, ph.DNSProfileID, ph.DNSZoneID, ph.DNSZoneName, ph.DNSRecordID)
 	}
+	note := s.noteFleetDeletion(models.FleetResourceProxy, id, ph.Domains)
 	if err := models.DeleteProxyHost(s.DB, id); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	_ = models.LogActivity(s.DB, ph.ServerID, s.currentUserEmail(r), "proxy_delete", fmt.Sprintf("proxy:%d", id), ph.Domains, true)
-	s.trySyncCaddy(ph.ServerID, false)
+	s.trySyncCaddyAfterDelete(ph.ServerID, false)
+	s.propagateNotedDeletion(s.currentUserEmail(r), note) // v2.59.0 (issue #120)
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id})
 }
 
@@ -622,6 +694,17 @@ func (s *Server) apiV1CreateRedirectionHost(w http.ResponseWriter, r *http.Reque
 	if !cu.IsAdmin {
 		ownerID = cu.ID
 	}
+	if msg := s.validateRedirectionForUser(cu, rh); msg != "" { // v2.57.1
+		writeJSONError(w, http.StatusBadRequest, msg)
+		return
+	}
+	if conflict, err := models.DomainsConflict(s.DB, serverID, rh.DomainList(), 0, 0); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "could not validate domains: "+err.Error())
+		return
+	} else if conflict != "" {
+		writeJSONError(w, http.StatusConflict, fmt.Sprintf("domain %q is already in use by another proxy or redirect on this server", conflict))
+		return
+	}
 	newID, err := models.CreateRedirectionHost(s.DB, serverID, ownerID, rh)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
@@ -691,6 +774,17 @@ func (s *Server) apiV1UpdateRedirectionHost(w http.ResponseWriter, r *http.Reque
 	if inp.Notes != "" {
 		existing.Notes = inp.Notes
 	}
+	if msg := s.validateRedirectionForUser(s.currentUser(r), existing); msg != "" { // v2.57.1
+		writeJSONError(w, http.StatusBadRequest, msg)
+		return
+	}
+	if conflict, err := models.DomainsConflict(s.DB, s.currentServerID(r), existing.DomainList(), 0, existing.ID); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "could not validate domains: "+err.Error())
+		return
+	} else if conflict != "" {
+		writeJSONError(w, http.StatusConflict, fmt.Sprintf("domain %q is already in use by another proxy or redirect on this server", conflict))
+		return
+	}
 	if err := models.UpdateRedirectionHost(s.DB, existing); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -720,12 +814,14 @@ func (s *Server) apiV1DeleteRedirectionHost(w http.ResponseWriter, r *http.Reque
 		writeJSONError(w, http.StatusForbidden, "forbidden")
 		return
 	}
+	note := s.noteFleetDeletion(models.FleetResourceRedirect, id, existing.Domains)
 	if err := models.DeleteRedirectionHost(s.DB, id); err != nil {
 		writeJSONError(w, http.StatusNotFound, "not found")
 		return
 	}
 	_ = models.LogActivity(s.DB, s.currentServerID(r), s.currentUserEmail(r), "redirect_delete", fmt.Sprintf("redir:%d", id), "", true)
-	s.trySyncCaddy(s.currentServerID(r), false)
+	s.trySyncCaddyAfterDelete(s.currentServerID(r), false)
+	s.propagateNotedDeletion(s.currentUserEmail(r), note)
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id})
 }
 
@@ -850,6 +946,10 @@ func (s *Server) apiV1CreateRawRoute(w http.ResponseWriter, r *http.Request) {
 	if !cu.IsAdmin {
 		ownerID = cu.ID
 	}
+	if msg := s.validateRawRouteForUser(cu, rr); msg != "" { // v2.57.1
+		writeJSONError(w, http.StatusBadRequest, msg)
+		return
+	}
 	newID, err := models.CreateRawRoute(s.DB, serverID, ownerID, rr)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
@@ -909,6 +1009,10 @@ func (s *Server) apiV1UpdateRawRoute(w http.ResponseWriter, r *http.Request) {
 	if inp.CertificateID != 0 {
 		existing.CertificateID = inp.CertificateID
 	}
+	if msg := s.validateRawRouteForUser(s.currentUser(r), existing); msg != "" { // v2.57.1
+		writeJSONError(w, http.StatusBadRequest, msg)
+		return
+	}
 	if err := models.UpdateRawRoute(s.DB, existing); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -938,12 +1042,14 @@ func (s *Server) apiV1DeleteRawRoute(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusForbidden, "forbidden")
 		return
 	}
+	note := s.noteFleetDeletion(models.FleetResourceRawRoute, id, existing.Label)
 	if err := models.DeleteRawRoute(s.DB, id); err != nil {
 		writeJSONError(w, http.StatusNotFound, "not found")
 		return
 	}
 	_ = models.LogActivity(s.DB, s.currentServerID(r), s.currentUserEmail(r), "rawroute_delete", fmt.Sprintf("rr:%d", id), "", true)
-	s.trySyncCaddy(s.currentServerID(r), false)
+	s.trySyncCaddyAfterDelete(s.currentServerID(r), false)
+	s.propagateNotedDeletion(s.currentUserEmail(r), note)
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id})
 }
 
@@ -977,12 +1083,25 @@ func (s *Server) apiV1ToggleRawRoute(w http.ResponseWriter, r *http.Request) {
 
 // --- REST JSON API v1: Certificates ---
 
-func certificateToAPIMap(c *models.Certificate) map[string]any {
+// apiCallerMaySeeSecrets reports whether this request may be shown stored
+// secrets such as certificate private keys: a signed-in browser session or a
+// full-scope token. read_only and proxy_write tokens are the kind of credential
+// that ends up in dashboards and CI logs, so they never receive key material
+// even when the user that owns them could read it.
+func apiCallerMaySeeSecrets(r *http.Request) bool {
+	switch currentAPITokenScope(r) {
+	case "", models.TokenScopeFull:
+		return true
+	}
+	return false
+}
+
+func certificateToAPIMap(c *models.Certificate, includeSecrets bool) map[string]any {
 	ownerID := int64(0)
 	if c.OwnerID.Valid {
 		ownerID = c.OwnerID.Int64
 	}
-	return map[string]any{
+	out := map[string]any{
 		"id":             c.ID,
 		"name":           c.Name,
 		"domains":        c.Domains,
@@ -998,6 +1117,16 @@ func certificateToAPIMap(c *models.Certificate) map[string]any {
 		"created_at":     c.CreatedAt,
 		"updated_at":     c.UpdatedAt,
 	}
+	// Security (v2.57.1): private keys and file paths are only for callers who
+	// may manage the row. The list endpoint used to return key_pem for every
+	// admin-owned (global) certificate to any role — including read-only
+	// tokens — because the single-row GET checked ownership and the list did not.
+	if !includeSecrets {
+		delete(out, "key_pem")
+		delete(out, "key_path")
+		delete(out, "cert_path")
+	}
+	return out
 }
 
 // GET /api/v1/certificates
@@ -1014,7 +1143,7 @@ func (s *Server) apiV1ListCertificates(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]map[string]any, 0, len(certs))
 	for i := range certs {
-		out = append(out, certificateToAPIMap(&certs[i]))
+		out = append(out, certificateToAPIMap(&certs[i], s.canManageOwned(cu, certs[i].OwnerID) && apiCallerMaySeeSecrets(r)))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -1035,7 +1164,7 @@ func (s *Server) apiV1GetCertificate(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusForbidden, "forbidden")
 		return
 	}
-	writeJSON(w, http.StatusOK, certificateToAPIMap(c))
+	writeJSON(w, http.StatusOK, certificateToAPIMap(c, apiCallerMaySeeSecrets(r))) // canManageOwned passed above
 }
 
 // POST /api/v1/certificates
@@ -1089,7 +1218,7 @@ func (s *Server) apiV1CreateCertificate(w http.ResponseWriter, r *http.Request) 
 		created = c
 		created.ID = newID
 	}
-	writeJSON(w, http.StatusCreated, certificateToAPIMap(created))
+	writeJSON(w, http.StatusCreated, certificateToAPIMap(created, apiCallerMaySeeSecrets(r)))
 }
 
 // PUT /api/v1/certificates/{id}
@@ -1159,7 +1288,7 @@ func (s *Server) apiV1UpdateCertificate(w http.ResponseWriter, r *http.Request) 
 	if updated == nil {
 		updated = existing
 	}
-	writeJSON(w, http.StatusOK, certificateToAPIMap(updated))
+	writeJSON(w, http.StatusOK, certificateToAPIMap(updated, apiCallerMaySeeSecrets(r)))
 }
 
 // DELETE /api/v1/certificates/{id}

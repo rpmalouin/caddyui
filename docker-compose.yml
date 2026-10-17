@@ -30,10 +30,13 @@ services:
       # Cloudflare API token for DNS-01 challenges (wildcard certs).
       # Read by the Caddyfile `tls { dns cloudflare {env.CF_API_TOKEN} }`.
       CF_API_TOKEN: ${CF_API_TOKEN}
-    command: >-
-      mkdir -p /config/caddy;
-      [ -f /config/caddy/autosave.json ] || echo '{}' > /config/caddy/autosave.json;
-      exec caddy run --config /config/caddy/autosave.json --resume --adapter json
+    command:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /config/caddy
+        [ -f /config/caddy/autosave.json ] || echo '{}' > /config/caddy/autosave.json
+        exec caddy run --config /config/caddy/autosave.json --resume --adapter json
     networks:
       - caddyui
 
@@ -70,6 +73,11 @@ services:
       # a writable directory the consuming service also mounts.
       # - caddy_data:/caddy-data:ro
       # - ./exports:/exports
+      # Caddy keeps that volume private to its own user (root, mode 0700), so
+      # for certificate export CaddyUI has to run as root too — uncomment
+      # `user: "0:0"` below (the data mount stays read-only). Without it export
+      # fails with "permission denied".
+    # user: "0:0"   # needed only for certificate export (see above)
     environment:
       CADDYUI_DB: /data/caddyui.db
       CADDYUI_LISTEN: :8080
@@ -85,6 +93,12 @@ services:
       # override per-user from Settings → Timezone; the DB value wins
       # over this env var when both are set.
       TZ: ${TZ:-UTC}
+      # Escape hatch for the admin panel IP allowlist (Settings → Security).
+      # Uncomment and restart if a saved allowlist locks you out: this value
+      # overrides the stored list, and "off" disables the gate entirely while
+      # you get back in. What you saved in the UI is left untouched, so
+      # commenting this out again restores it. Leave it unset normally.
+      # CADDYUI_ADMIN_ALLOWLIST: "off"
     networks:
       - caddyui
 

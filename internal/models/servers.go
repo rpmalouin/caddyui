@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -49,9 +50,77 @@ type CaddyServer struct {
 	// service's caddy_data volume). Lets CaddyUI read the certificates Caddy
 	// stored and export them to a directory (Certificates → Export). Empty =
 	// not mounted; only a Caddy whose volume this host can see can set it.
-	DataDir       string
-	LastContactAt sql.NullTime
-	CreatedAt     time.Time
+	DataDir string
+	// Layer4Caddyfile (v2.56.0, issue #113) is an optional, complete
+	// `layer4 { ... }` Caddyfile block (github.com/mholt/caddy-l4) pasted by
+	// the admin, including the wrapper. On every sync it is adapted through
+	// THIS server's own admin API and only the resulting apps.layer4 subtree
+	// is merged into the pushed config — any other key the adapt response
+	// happens to contain is discarded. Requires a Caddy build with the
+	// caddy-l4 module compiled in (e.g. the applegater/caddyui-caddy image).
+	// Empty = no layer4 app pushed, the behavior for every server before
+	// this field existed.
+	Layer4Caddyfile string
+	// DefaultDeployTargets (v2.57.0, issue #120) is a comma-separated list of
+	// CaddyServer IDs that every proxy host, redirection and advanced route
+	// saved on THIS server in the web UI is automatically mirrored to — the
+	// persistent form of the per-save "Also deploy to" picker, for a fleet
+	// where one Caddy is the configuration source for a fixed set of edge
+	// nodes. Empty = nothing automatic, the behavior before this field existed.
+	// Independent of Layer4Caddyfile's own "Also copy to" picker.
+	DefaultDeployTargets string
+	// PropagateDeletions (v2.59.0, issue #120) makes the deletion of a proxy
+	// host, redirection, advanced route or Layer4 proxy on THIS server also
+	// delete the paired copies it previously deployed to its
+	// DefaultDeployTargets. Off by default: nothing is ever deleted on another
+	// server unless an administrator opts in.
+	PropagateDeletions bool
+	LastContactAt      sql.NullTime
+	CreatedAt          time.Time
+
+	// IsDefaultDeployTarget is view state, never stored: set on the entries of
+	// a resource form's "Also deploy to" list when that server is one of the
+	// currently selected server's DefaultDeployTargets, so the form can show
+	// it as always-on instead of an unchecked box that has to be re-ticked.
+	IsDefaultDeployTarget bool
+}
+
+// DefaultDeployTargetIDs parses DefaultDeployTargets into server IDs, dropping
+// anything blank, non-numeric, non-positive or repeated. Same comma-separated
+// convention as Certificate.FleetPushTargetIDs.
+func (c CaddyServer) DefaultDeployTargetIDs() []int64 {
+	var out []int64
+	seen := map[int64]bool{}
+	for _, part := range strings.Split(c.DefaultDeployTargets, ",") {
+		id, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64)
+		if err != nil || id <= 0 || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
+}
+
+// DefaultDeployTargetSet is DefaultDeployTargetIDs as a set, for template
+// lookups — server_form.html pre-checks the boxes already saved as defaults.
+func (c CaddyServer) DefaultDeployTargetSet() map[int64]bool {
+	ids := c.DefaultDeployTargetIDs()
+	out := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		out[id] = true
+	}
+	return out
+}
+
+// JoinServerIDs formats server IDs as the comma-separated string
+// DefaultDeployTargets stores.
+func JoinServerIDs(ids []int64) string {
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = strconv.FormatInt(id, 10)
+	}
+	return strings.Join(parts, ",")
 }
 
 func (c CaddyServer) TagList() []string {
@@ -66,13 +135,13 @@ func (c CaddyServer) TagList() []string {
 	return out
 }
 
-const caddyServerCols = `id, name, admin_url, type, tags, status, COALESCE(version,''), COALESCE(admin_username,''), COALESCE(admin_password,''), COALESCE(public_ip,''), COALESCE(ingest_target,''), COALESCE(data_dir,''), last_contact_at, created_at`
+const caddyServerCols = `id, name, admin_url, type, tags, status, COALESCE(version,''), COALESCE(admin_username,''), COALESCE(admin_password,''), COALESCE(public_ip,''), COALESCE(ingest_target,''), COALESCE(data_dir,''), COALESCE(layer4_caddyfile,''), COALESCE(default_deploy_targets,''), COALESCE(propagate_deletions,0), last_contact_at, created_at`
 
 func scanCaddyServer(s interface {
 	Scan(dest ...any) error
 }) (CaddyServer, error) {
 	var c CaddyServer
-	err := s.Scan(&c.ID, &c.Name, &c.AdminURL, &c.Type, &c.Tags, &c.Status, &c.Version, &c.AdminUsername, &c.AdminPassword, &c.PublicIP, &c.IngestTarget, &c.DataDir, &c.LastContactAt, &c.CreatedAt)
+	err := s.Scan(&c.ID, &c.Name, &c.AdminURL, &c.Type, &c.Tags, &c.Status, &c.Version, &c.AdminUsername, &c.AdminPassword, &c.PublicIP, &c.IngestTarget, &c.DataDir, &c.Layer4Caddyfile, &c.DefaultDeployTargets, &c.PropagateDeletions, &c.LastContactAt, &c.CreatedAt)
 	return c, err
 }
 
@@ -173,11 +242,12 @@ func CreateCaddyServer(db *sql.DB, c *CaddyServer) (int64, error) {
 		c.Status = CaddyServerStatusUnknown
 	}
 	res, err := db.Exec(
-		`INSERT INTO caddy_servers (name, admin_url, type, tags, status, admin_username, admin_password, public_ip, ingest_target, data_dir) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO caddy_servers (name, admin_url, type, tags, status, admin_username, admin_password, public_ip, ingest_target, data_dir, layer4_caddyfile, default_deploy_targets, propagate_deletions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		strings.TrimSpace(c.Name), strings.TrimRight(strings.TrimSpace(c.AdminURL), "/"),
 		c.Type, strings.TrimSpace(c.Tags), c.Status,
 		strings.TrimSpace(c.AdminUsername), c.AdminPassword,
 		strings.TrimSpace(c.PublicIP), strings.TrimSpace(c.IngestTarget), strings.TrimSpace(c.DataDir),
+		strings.TrimSpace(c.Layer4Caddyfile), strings.TrimSpace(c.DefaultDeployTargets), c.PropagateDeletions,
 	)
 	if err != nil {
 		return 0, err
@@ -188,11 +258,12 @@ func CreateCaddyServer(db *sql.DB, c *CaddyServer) (int64, error) {
 func UpdateCaddyServer(db *sql.DB, c *CaddyServer) error {
 	c.Type = normalizeServerType(c.Type)
 	_, err := db.Exec(
-		`UPDATE caddy_servers SET name=?, admin_url=?, type=?, tags=?, version=?, admin_username=?, admin_password=?, public_ip=?, ingest_target=?, data_dir=? WHERE id=?`,
+		`UPDATE caddy_servers SET name=?, admin_url=?, type=?, tags=?, version=?, admin_username=?, admin_password=?, public_ip=?, ingest_target=?, data_dir=?, layer4_caddyfile=?, default_deploy_targets=?, propagate_deletions=? WHERE id=?`,
 		strings.TrimSpace(c.Name), strings.TrimRight(strings.TrimSpace(c.AdminURL), "/"),
 		c.Type, strings.TrimSpace(c.Tags), strings.TrimSpace(c.Version),
 		strings.TrimSpace(c.AdminUsername), c.AdminPassword,
-		strings.TrimSpace(c.PublicIP), strings.TrimSpace(c.IngestTarget), strings.TrimSpace(c.DataDir), c.ID,
+		strings.TrimSpace(c.PublicIP), strings.TrimSpace(c.IngestTarget), strings.TrimSpace(c.DataDir),
+		strings.TrimSpace(c.Layer4Caddyfile), strings.TrimSpace(c.DefaultDeployTargets), c.PropagateDeletions, c.ID,
 	)
 	return err
 }
@@ -212,8 +283,43 @@ func DeleteCaddyServer(db *sql.DB, id int64) error {
 	if err := DeleteFleetDeploymentsForServer(db, id); err != nil {
 		return err
 	}
+	if err := DeleteFleetPendingForServer(db, id); err != nil {
+		return err
+	}
+	if err := removeDefaultDeployTarget(db, id); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`DELETE FROM layer4_proxies WHERE server_id=?`, id); err != nil {
+		return err
+	}
 	_, err := db.Exec(`DELETE FROM caddy_servers WHERE id=?`, id)
 	return err
+}
+
+// removeDefaultDeployTarget drops a deleted server's ID from every other
+// server's DefaultDeployTargets, so a later server that reuses the ID can never
+// start receiving another server's resources by accident.
+func removeDefaultDeployTarget(db *sql.DB, deletedID int64) error {
+	servers, err := ListCaddyServers(db)
+	if err != nil {
+		return err
+	}
+	for _, srv := range servers {
+		ids := srv.DefaultDeployTargetIDs()
+		kept := ids[:0:0]
+		for _, id := range ids {
+			if id != deletedID {
+				kept = append(kept, id)
+			}
+		}
+		if len(kept) == len(ids) {
+			continue
+		}
+		if _, err := db.Exec(`UPDATE caddy_servers SET default_deploy_targets=? WHERE id=?`, JoinServerIDs(kept), srv.ID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func SetCaddyServerStatus(db *sql.DB, id int64, status string, contactedAt *time.Time) error {

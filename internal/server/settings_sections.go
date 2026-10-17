@@ -58,6 +58,28 @@ func settingsSectionLabel(slug string) string {
 	return "Settings"
 }
 
+// localizedSettingsSections is the navigation in lang (v2.63.0, issue #128).
+// The English text above is the source: en.json carries the same strings under
+// settings.section.<slug>.label / .blurb, and a test keeps the two equal.
+func localizedSettingsSections(lang string) []settingsSection {
+	b := translations()
+	out := make([]settingsSection, len(settingsSections))
+	for i, sec := range settingsSections {
+		sec.Label = b.T(lang, "settings.section."+sec.Slug+".label")
+		sec.Blurb = b.T(lang, "settings.section."+sec.Slug+".blurb")
+		out[i] = sec
+	}
+	return out
+}
+
+// localizedSettingsSectionLabel is settingsSectionLabel in lang.
+func localizedSettingsSectionLabel(lang, slug string) string {
+	if settingsSectionSlug(slug) == "" {
+		return translations().T(lang, "settings.title")
+	}
+	return translations().T(lang, "settings.section."+slug+".label")
+}
+
 // settingsAnchorSection maps the pre-v2.44.0 in-page anchors to the page
 // that now holds the card, for old links and bookmarks.
 var settingsAnchorSection = map[string]string{
@@ -87,6 +109,8 @@ var settingsKeySection = map[string]string{
 	settingSiteTitle:                  "general",
 	settingFaviconURL:                 "general",
 	settingCatchAll404HTML:            "general",
+	settingFallbackStatus:             "general", // v2.60.0 (issue #123)
+	settingDefaultLocale:              "general", // v2.62.0 (issue #128)
 	settingGlobalMaintenance:          "general",
 	settingAutoSyncHours:              "general",
 	settingActivityLogDays:            "general",
@@ -111,6 +135,7 @@ var settingsKeySection = map[string]string{
 	settingServerIP:          "dns",
 	settingCFProxied:         "dns",
 	settingDNSVerifyResolver: "dns",
+	settingACMEDNSResolvers:  "dns",
 
 	settingRequire2FA:         "security",
 	settingRequireTOTP:        "security",
@@ -126,6 +151,9 @@ var settingsKeySection = map[string]string{
 	settingOIDCRedirectURL:    "security",
 	settingOIDCAutoCreate:     "security",
 	settingOIDCButtonLabel:    "security",
+	settingOIDCDefaultRole:    "security", // v2.65.0 (issue #139)
+	settingOIDCGroupsClaim:    "security",
+	settingOIDCRoleMappings:   "security",
 	settingSessionDays:        "security",
 	settingMaxLoginAttempts:   "security",
 	settingCaptchaProvider:    "security",

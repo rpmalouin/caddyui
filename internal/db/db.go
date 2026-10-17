@@ -125,6 +125,24 @@ CREATE TABLE IF NOT EXISTS caddy_servers (
 -- Tracks one-way Caddy Fleet deployments so repeating "Also deploy to" or a
 -- full configuration sync updates the same target row instead of inserting a
 -- duplicate. Resource rows remain independently editable on each server.
+-- v2.58.0 (issue #122): first-class Layer4 (TCP/UDP) proxies. Each row is one
+-- listen -> upstream forward; CaddyUI generates the caddy-l4 server for it.
+CREATE TABLE IF NOT EXISTS layer4_proxies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    server_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    protocol TEXT NOT NULL DEFAULT 'tcp',
+    listen_addr TEXT NOT NULL DEFAULT '',
+    listen_port INTEGER NOT NULL,
+    upstream_host TEXT NOT NULL,
+    upstream_port INTEGER NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    node_local INTEGER NOT NULL DEFAULT 0,
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS fleet_deployments (
     source_server_id INTEGER NOT NULL,
     resource_kind VARCHAR(32) NOT NULL,
@@ -133,6 +151,54 @@ CREATE TABLE IF NOT EXISTS fleet_deployments (
     target_resource_id INTEGER NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (source_server_id, resource_kind, source_resource_id, target_server_id)
+);
+
+-- v2.60.0 (issue #124): reusable middleware profiles. Global (one controller
+-- database), so a profile attached to hosts on several fleet servers is the same
+-- row everywhere. A host's profile lives in proxy_host_profiles so the many
+-- proxy_hosts queries need no new column.
+CREATE TABLE IF NOT EXISTS middleware_profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name VARCHAR(191) NOT NULL UNIQUE,
+    description TEXT NOT NULL DEFAULT '',
+    security_headers INTEGER NOT NULL DEFAULT 0,
+    x_frame_options TEXT NOT NULL DEFAULT '',
+    referrer_policy TEXT NOT NULL DEFAULT '',
+    permissions_policy TEXT NOT NULL DEFAULT '',
+    csp_header TEXT NOT NULL DEFAULT '',
+    forward_auth_url TEXT NOT NULL DEFAULT '',
+    forward_auth_method TEXT NOT NULL DEFAULT '',
+    forward_auth_copy_headers TEXT NOT NULL DEFAULT '',
+    forward_auth_headers_prefix TEXT NOT NULL DEFAULT '',
+    forward_auth_skip_paths TEXT NOT NULL DEFAULT '',
+    access_list TEXT NOT NULL DEFAULT '',
+    ip_blocklist TEXT NOT NULL DEFAULT '',
+    custom_req_headers TEXT NOT NULL DEFAULT '',
+    custom_resp_headers TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS proxy_host_profiles (
+    proxy_host_id INTEGER PRIMARY KEY,
+    profile_id INTEGER NOT NULL
+);
+
+-- v2.59.0 (issue #120): deletions of paired fleet copies that still have to
+-- finish (the target's Caddy could not be reached yet). One row per source
+-- resource and target; removed as soon as the target's Caddy has converged.
+CREATE TABLE IF NOT EXISTS fleet_pending_deletions (
+    source_server_id INTEGER NOT NULL,
+    resource_kind VARCHAR(32) NOT NULL,
+    source_resource_id INTEGER NOT NULL,
+    target_server_id INTEGER NOT NULL,
+    target_resource_id INTEGER NOT NULL,
+    label TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    last_attempt_at TIMESTAMP NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (source_server_id, resource_kind, source_resource_id, target_server_id)
 );
 
@@ -2338,6 +2404,86 @@ func migrate(db *sql.DB) error {
 	}
 	if !columnExists2(db, "proxy_hosts", "rate_limit_window_sec") {
 		migrationStep(db, `ALTER TABLE proxy_hosts ADD COLUMN rate_limit_window_sec INTEGER NOT NULL DEFAULT 0`)
+	}
+
+	// v2.64.0 (discussion #137): client certificate authentication (mTLS).
+	// Empty mode means off, so existing hosts keep asking for no client
+	// certificate after upgrade.
+	if !columnExists2(db, "proxy_hosts", "client_auth_mode") {
+		migrationStep(db, `ALTER TABLE proxy_hosts ADD COLUMN client_auth_mode TEXT NOT NULL DEFAULT ''`)
+	}
+	if !columnExists2(db, "proxy_hosts", "client_auth_ca_files") {
+		migrationStep(db, `ALTER TABLE proxy_hosts ADD COLUMN client_auth_ca_files TEXT NOT NULL DEFAULT ''`)
+	}
+
+	// v2.55.0 (issue #115): opt-in "source push" fleet distribution for a
+	// Managed ACME certificate — one Caddy performs the ACME order and
+	// CaddyUI pushes the resulting certificate/key to the servers listed in
+	// fleet_push_targets instead of each of them running its own ACME order.
+	// Empty/default on every existing row, so behavior is unchanged until an
+	// operator opts in from the certificate form.
+	if !columnExists2(db, "certificates", "fleet_distribution_mode") {
+		migrationStep(db, `ALTER TABLE certificates ADD COLUMN fleet_distribution_mode TEXT NOT NULL DEFAULT ''`)
+	}
+	if !columnExists2(db, "certificates", "fleet_push_targets") {
+		migrationStep(db, `ALTER TABLE certificates ADD COLUMN fleet_push_targets TEXT NOT NULL DEFAULT ''`)
+	}
+
+	// v2.56.0 (issue #113): per-server layer4 app Caddyfile block. An admin
+	// pastes a complete `layer4 { ... }` block (github.com/mholt/caddy-l4);
+	// it is adapted through this server's own admin API on every sync and
+	// only the resulting apps.layer4 subtree is merged into the pushed
+	// config. Empty on every existing row — zero behavior change until an
+	// operator opts in from the server edit form.
+	if !columnExists2(db, "caddy_servers", "layer4_caddyfile") {
+		migrationStep(db, `ALTER TABLE caddy_servers ADD COLUMN layer4_caddyfile TEXT NOT NULL DEFAULT ''`)
+	}
+
+	// v2.57.0 (issue #120): persistent default deployment targets — the
+	// comma-separated IDs of the fleet servers every proxy host, redirection
+	// and advanced route saved on this server is automatically mirrored to.
+	// Empty on every existing row, so nothing deploys anywhere new until an
+	// operator picks targets on the server edit form.
+	if !columnExists2(db, "caddy_servers", "default_deploy_targets") {
+		migrationStep(db, `ALTER TABLE caddy_servers ADD COLUMN default_deploy_targets TEXT NOT NULL DEFAULT ''`)
+	}
+
+	// v2.59.0 (issue #120): opt-in per source server — deleting a proxy host,
+	// redirection, advanced route or Layer4 proxy also deletes its paired
+	// copies on the automatic deployment targets. Off on every existing row.
+	if !columnExists2(db, "caddy_servers", "propagate_deletions") {
+		migrationStep(db, `ALTER TABLE caddy_servers ADD COLUMN propagate_deletions INTEGER NOT NULL DEFAULT 0`)
+	}
+
+	// v2.61.0 (issue #126): a Layer4 proxy can share an HTTP server's listener
+	// through a caddy-l4 listener wrapper instead of binding its own port.
+	for _, col := range []struct{ name, ddl string }{
+		{"mode", `ALTER TABLE layer4_proxies ADD COLUMN mode TEXT NOT NULL DEFAULT ''`},
+		{"wrap_server", `ALTER TABLE layer4_proxies ADD COLUMN wrap_server TEXT NOT NULL DEFAULT ''`},
+		{"match_kind", `ALTER TABLE layer4_proxies ADD COLUMN match_kind TEXT NOT NULL DEFAULT ''`},
+		{"match_hosts", `ALTER TABLE layer4_proxies ADD COLUMN match_hosts TEXT NOT NULL DEFAULT ''`},
+		{"terminate_tls", `ALTER TABLE layer4_proxies ADD COLUMN terminate_tls INTEGER NOT NULL DEFAULT 0`},
+	} {
+		if !columnExists2(db, "layer4_proxies", col.name) {
+			migrationStep(db, col.ddl)
+		}
+	}
+
+	// v2.61.0: Coraza WAF choice on middleware profiles.
+	for _, col := range []struct{ name, ddl string }{
+		{"waf_mode", `ALTER TABLE middleware_profiles ADD COLUMN waf_mode TEXT NOT NULL DEFAULT ''`},
+		{"waf_crs", `ALTER TABLE middleware_profiles ADD COLUMN waf_crs INTEGER NOT NULL DEFAULT 0`},
+		{"waf_paranoia", `ALTER TABLE middleware_profiles ADD COLUMN waf_paranoia INTEGER NOT NULL DEFAULT 0`},
+		{"waf_directives", `ALTER TABLE middleware_profiles ADD COLUMN waf_directives TEXT NOT NULL DEFAULT ''`},
+	} {
+		if !columnExists2(db, "middleware_profiles", col.name) {
+			migrationStep(db, col.ddl)
+		}
+	}
+
+	// v2.62.0 (issue #128): each user's interface language ("" = follow the browser).
+	if !columnExists2(db, "users", "locale") {
+		migrationStep(db, `ALTER TABLE users ADD COLUMN locale TEXT NOT NULL DEFAULT ''`)
 	}
 
 	// One loud summary rather than leaving the operator to spot individual

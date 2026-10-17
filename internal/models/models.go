@@ -35,6 +35,7 @@ type User struct {
 	TOTPEnabled  bool
 	BackupCodes  string // JSON array of SHA-256 hex hashes; empty means no backup codes set
 	ColorTheme   string // v2.12.27: "" = default | "orange" — synced across devices via DB
+	Locale       string // v2.62.0 (issue #128): "" = follow the browser, else a catalog code such as "zh-CN"
 }
 
 const (
@@ -47,6 +48,10 @@ func (u *User) IsViewer() bool { return u != nil && u.Role == RoleView }
 func (u *User) CanWrite() bool { return u != nil && u.Role != RoleView }
 
 type ProxyHost struct {
+	// WAF (v2.61.0) is set ONLY on the per-sync copy of a host that has a
+	// middleware profile with a Coraza WAF; it is never read from or written to
+	// the database.
+	WAF                 *WAFSettings
 	ID                  int64
 	ServerID            int64 // v2.4.0: which caddy_servers row this host belongs to (for per-server public-IP lookup)
 	Domains             string
@@ -695,8 +700,57 @@ type ProxyHost struct {
 	RateLimitEnabled   bool
 	RateLimitEvents    int
 	RateLimitWindowSec int
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	// v2.64.0 (discussion #137): client certificate authentication (mTLS).
+	// Caddy asks the client for a certificate during the TLS handshake and
+	// validates it against the CA(s) in ClientAuthCAFiles. This lands in the
+	// per-SNI entry of tls_connection_policies, NOT in the route — see
+	// caddy.BuildTLSConnectionPolicies. Distinct from the UpstreamTLSClient*
+	// fields, which are Caddy presenting a certificate *to the backend*.
+	ClientAuthMode    string // "" (off) | request | require | verify_if_given | require_and_verify
+	ClientAuthCAFiles string // newline-separated PEM paths holding the trusted CA(s)
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+}
+
+// ClientAuthCAFileList splits ClientAuthCAFiles into individual PEM paths,
+// accepting newline- or comma-separated input and dropping blanks.
+func (p ProxyHost) ClientAuthCAFileList() []string {
+	if strings.TrimSpace(p.ClientAuthCAFiles) == "" {
+		return nil
+	}
+	var out []string
+	for _, f := range strings.FieldsFunc(p.ClientAuthCAFiles, func(r rune) bool {
+		return r == '\n' || r == '\r' || r == ','
+	}) {
+		if f = strings.TrimSpace(f); f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// ClientAuthEnabled reports whether this host asks clients for a certificate.
+// A mode is enough: require/request without a trust pool is valid in Caddy
+// (it asks for a certificate without verifying the issuer), and verifying
+// modes are rejected without CA files by the form handler.
+func (p ProxyHost) ClientAuthEnabled() bool {
+	return ValidClientAuthMode(p.ClientAuthMode) && p.ClientAuthMode != ""
+}
+
+// ValidClientAuthMode reports whether mode is one of Caddy's client_auth
+// modes ("" means the feature is off).
+func ValidClientAuthMode(mode string) bool {
+	switch mode {
+	case "", "request", "require", "verify_if_given", "require_and_verify":
+		return true
+	}
+	return false
+}
+
+// ClientAuthModeVerifies reports whether the mode validates the client
+// certificate chain, which is the case where a trust pool is required.
+func ClientAuthModeVerifies(mode string) bool {
+	return mode == "verify_if_given" || mode == "require_and_verify"
 }
 
 // MonitoringDisabled reports whether the operator has switched CaddyUI's own
@@ -1139,14 +1193,14 @@ func (r RedirectionHost) CustomRespHeaderMap() map[string]string {
 const userCols = `id, email, password_hash, COALESCE(name,''), is_admin,
     COALESCE(role, CASE WHEN is_admin=1 THEN 'admin' ELSE 'view' END), created_at,
     COALESCE(totp_secret,''), COALESCE(totp_enabled,0), COALESCE(totp_backup_codes,''),
-    COALESCE(color_theme,'')`
+    COALESCE(color_theme,''), COALESCE(locale,'')`
 
 func scanUser(s interface {
 	Scan(dest ...any) error
 }) (*User, error) {
 	u := &User{}
 	var isAdmin, totpEnabled int
-	if err := s.Scan(&u.ID, &u.Email, &u.PasswordHash, &u.Name, &isAdmin, &u.Role, &u.CreatedAt, &u.TOTPSecret, &totpEnabled, &u.BackupCodes, &u.ColorTheme); err != nil {
+	if err := s.Scan(&u.ID, &u.Email, &u.PasswordHash, &u.Name, &isAdmin, &u.Role, &u.CreatedAt, &u.TOTPSecret, &totpEnabled, &u.BackupCodes, &u.ColorTheme, &u.Locale); err != nil {
 		return nil, err
 	}
 	u.IsAdmin = isAdmin == 1
@@ -1159,6 +1213,13 @@ func scanUser(s interface {
 		}
 	}
 	return u, nil
+}
+
+// UpdateUserLocale stores the user's language ("" = follow the browser).
+// v2.62.0 (issue #128).
+func UpdateUserLocale(db *sql.DB, userID int64, locale string) error {
+	_, err := db.Exec(`UPDATE users SET locale = ? WHERE id = ?`, locale, userID)
+	return err
 }
 
 // UpdateUserColorTheme stores the user's preferred color theme so it
@@ -1501,28 +1562,16 @@ func UpdateUser(db *sql.DB, id int64, name, role string) error {
 	return err
 }
 
+// UpdateUserPassword sets a new password hash and signs the account out
+// everywhere: every session of the user is deleted. Previously a stolen session
+// survived the password reset that was meant to evict it (v2.57.1). Callers that
+// change a password for the signed-in user keep that one session with
+// auth.DeleteOtherSessions after re-creating it.
 func UpdateUserPassword(db *sql.DB, id int64, passwordHash string) error {
-	_, err := db.Exec(`UPDATE users SET password_hash=? WHERE id=?`, passwordHash, id)
-	return err
-}
-
-// DeleteSessionsForUser drops the stored sessions belonging to one user.
-//
-// Review finding #11 (2026-10-04): changing or resetting a password left every
-// existing session valid for the remainder of its TTL, so the account-recovery
-// path (forgot-password) never evicted a session an attacker had already
-// stolen. Callers revoke on password reset, on invite acceptance, and when an
-// admin sets a user's password.
-//
-// keepToken is a HASHED session token (auth.HashSessionToken) to preserve, so a
-// user changing their own password stays signed in on the device they used
-// while every other session is dropped. Empty keepToken revokes all of them.
-func DeleteSessionsForUser(db *sql.DB, userID int64, keepToken string) error {
-	if strings.TrimSpace(keepToken) == "" {
-		_, err := db.Exec(`DELETE FROM sessions WHERE user_id = ?`, userID)
+	if _, err := db.Exec(`UPDATE users SET password_hash=? WHERE id=?`, passwordHash, id); err != nil {
 		return err
 	}
-	_, err := db.Exec(`DELETE FROM sessions WHERE user_id = ? AND token <> ?`, userID, keepToken)
+	_, err := db.Exec(`DELETE FROM sessions WHERE user_id=?`, id)
 	return err
 }
 
@@ -1870,7 +1919,9 @@ const proxyHostBaseCols = `ph.id, ph.server_id, ph.domains, ph.forward_scheme, p
     COALESCE(ph.internal_tls,0),
     COALESCE(ph.rate_limit_enabled,0),
     COALESCE(ph.rate_limit_events,0),
-    COALESCE(ph.rate_limit_window_sec,0)`
+    COALESCE(ph.rate_limit_window_sec,0),
+    COALESCE(ph.client_auth_mode,''),
+    COALESCE(ph.client_auth_ca_files,'')`
 
 // scanProxyHost pulls a single row into the struct. Centralises the
 // bool-int unpack so each query site doesn't repeat it.
@@ -2196,6 +2247,7 @@ func scanProxyHost(s interface {
 		&nodeLocal,                                                   // v2.33.0
 		&internalTLS,                                                 // v2.46.0
 		&rateLimitEnabled, &p.RateLimitEvents, &p.RateLimitWindowSec, // v2.51.0
+		&p.ClientAuthMode, &p.ClientAuthCAFiles, // v2.64.0 (discussion #137)
 	}
 	if ownerEmail != nil {
 		dst = append(dst, ownerEmail)
@@ -2647,8 +2699,9 @@ func CreateProxyHost(db *sql.DB, serverID int64, ownerID int64, p *ProxyHost) (i
             additional_upstream_rules, expectations_json, disable_upstream_compression,
             monitor_mode, monitor_path, monitor_method, monitor_expect_status,
             monitor_interval_sec, monitor_timeout_sec, node_local, internal_tls,
-            rate_limit_enabled, rate_limit_events, rate_limit_window_sec)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            rate_limit_enabled, rate_limit_events, rate_limit_window_sec,
+            client_auth_mode, client_auth_ca_files)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		serverID,
 		p.Domains, p.ForwardScheme, p.ForwardHost, p.ForwardPort,
 		boolInt(p.WebsocketSupport), boolInt(p.BlockCommonExploits),
@@ -2776,6 +2829,7 @@ func CreateProxyHost(db *sql.DB, serverID int64, ownerID int64, p *ProxyHost) (i
 		boolInt(p.NodeLocal),                                                 // v2.33.0
 		boolInt(p.InternalTLS),                                               // v2.46.0
 		boolInt(p.RateLimitEnabled), p.RateLimitEvents, p.RateLimitWindowSec, // v2.51.0
+		p.ClientAuthMode, p.ClientAuthCAFiles, // v2.64.0 (discussion #137)
 	)
 	if err != nil {
 		return 0, err
@@ -3112,6 +3166,7 @@ func UpdateProxyHost(db *sql.DB, p *ProxyHost) error {
             node_local=?,
             internal_tls=?,
             rate_limit_enabled=?, rate_limit_events=?, rate_limit_window_sec=?,
+            client_auth_mode=?, client_auth_ca_files=?,
             updated_at=CURRENT_TIMESTAMP
         WHERE id = ?`,
 		p.Domains, p.ForwardScheme, p.ForwardHost, p.ForwardPort,
@@ -3421,6 +3476,7 @@ func UpdateProxyHost(db *sql.DB, p *ProxyHost) error {
 		boolInt(p.NodeLocal),                                                 // v2.33.0
 		boolInt(p.InternalTLS),                                               // v2.46.0
 		boolInt(p.RateLimitEnabled), p.RateLimitEvents, p.RateLimitWindowSec, // v2.51.0
+		p.ClientAuthMode, p.ClientAuthCAFiles, // v2.64.0 (discussion #137)
 		p.ID,
 	)
 	if err != nil {
@@ -3564,6 +3620,10 @@ func ToggleRawRoute(db *sql.DB, id int64) (bool, error) {
 
 func DeleteProxyHost(db *sql.DB, id int64) error {
 	_, err := db.Exec(`DELETE FROM proxy_hosts WHERE id = ?`, id)
+	if err == nil {
+		// v2.60.0 (issue #124): a deleted host leaves no profile attachment behind.
+		_, err = db.Exec(`DELETE FROM proxy_host_profiles WHERE proxy_host_id = ?`, id)
+	}
 	return err
 }
 
@@ -4265,6 +4325,18 @@ const (
 	CertSourcePEM     = "pem"
 	CertSourcePath    = "path"
 	CertSourceManaged = "managed"
+
+	// v2.55.0 (issue #115): fleet-distribution modes for a Managed ACME
+	// certificate that has one or more "also configure on" targets.
+	// CertFleetDistributionIndependent (the zero value, and the only
+	// behavior before v2.55.0) means every target server performs its own
+	// ACME order — fleetCertificateCopy clones the DNS-01 definition only.
+	// CertFleetDistributionSourcePush means this server performs the ACME
+	// order and CaddyUI pushes the resulting certificate and private key to
+	// the targets instead, so they need no DNS credentials and run no ACME
+	// of their own. See internal/server/fleet_sync.go.
+	CertFleetDistributionIndependent = ""
+	CertFleetDistributionSourcePush  = "source_push"
 )
 
 type Certificate struct {
@@ -4281,9 +4353,24 @@ type Certificate struct {
 	// v2.42.0: Export is the JSON export configuration (certificate_export.go)
 	// for a managed certificate — copy it out of Caddy's storage to a
 	// directory after every issuance/renewal. Empty = off.
-	Export    string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	Export string
+	// v2.55.0 (issue #115): FleetDistributionMode opts a Managed ACME
+	// certificate into "source push" fleet distribution (see
+	// CertFleetDistributionSourcePush). Only meaningful when
+	// Source == CertSourceManaged; empty ("", CertFleetDistributionIndependent)
+	// is the original, default behavior and is left untouched for every
+	// certificate that doesn't explicitly opt in.
+	FleetDistributionMode string
+	// FleetPushTargets is the comma-separated list of target CaddyServer IDs
+	// this certificate's PEM is pushed to when
+	// FleetDistributionMode == CertFleetDistributionSourcePush. It is set from
+	// the "Also configure on" picker and read independently by the
+	// certificate lifecycle reconciler (pushSharedManagedCertificates), so a
+	// renewal is re-pushed on the reconciler's own schedule rather than only
+	// when the certificate form is saved again.
+	FleetPushTargets string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 
 	// v2.7.2: per-user ownership. OwnerID.Valid == false means admin-owned /
 	// global — any user-role account can reference it from the proxy-host
@@ -4294,6 +4381,35 @@ type Certificate struct {
 	// otherwise to avoid a JOIN round-trip in the non-admin hot path.
 	OwnerID    sql.NullInt64
 	OwnerEmail string
+}
+
+// FleetPushTargetIDs parses FleetPushTargets into target CaddyServer IDs,
+// dropping anything blank or unparsable. Mirrors DomainList's comma-separated
+// convention.
+func (c Certificate) FleetPushTargetIDs() []int64 {
+	parts := strings.Split(c.FleetPushTargets, ",")
+	out := make([]int64, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if id, err := strconv.ParseInt(p, 10, 64); err == nil && id > 0 {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// FleetPushTargetSet is FleetPushTargetIDs as a set, for template lookups —
+// certificate_form.html pre-checks "Also configure on" boxes that are already
+// a source-push target.
+func (c Certificate) FleetPushTargetSet() map[int64]bool {
+	out := make(map[int64]bool, len(c.FleetPushTargets))
+	for _, id := range c.FleetPushTargetIDs() {
+		out[id] = true
+	}
+	return out
 }
 
 func (c Certificate) DomainList() []string {
@@ -4316,7 +4432,9 @@ func (c Certificate) DomainList() []string {
 func ListCertificates(db *sql.DB, serverID int64) ([]Certificate, error) {
 	rows, err := db.Query(`
         SELECT id, name, domains, source, cert_pem, key_pem, cert_path, key_path,
-               COALESCE(dns_provider,''), COALESCE(dns_profile_id,''), COALESCE(export_json,''), owner_id, created_at, updated_at
+               COALESCE(dns_provider,''), COALESCE(dns_profile_id,''), COALESCE(export_json,''),
+               COALESCE(fleet_distribution_mode,''), COALESCE(fleet_push_targets,''),
+               owner_id, created_at, updated_at
         FROM certificates WHERE server_id = ? ORDER BY id DESC`, serverID)
 	if err != nil {
 		return nil, err
@@ -4327,7 +4445,8 @@ func ListCertificates(db *sql.DB, serverID int64) ([]Certificate, error) {
 		var c Certificate
 		if err := rows.Scan(&c.ID, &c.Name, &c.Domains, &c.Source,
 			&c.CertPEM, &c.KeyPEM, &c.CertPath, &c.KeyPath,
-			&c.DNSProvider, &c.DNSProfileID, &c.Export, &c.OwnerID,
+			&c.DNSProvider, &c.DNSProfileID, &c.Export,
+			&c.FleetDistributionMode, &c.FleetPushTargets, &c.OwnerID,
 			&c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
@@ -4351,6 +4470,7 @@ func ListCertificatesForUser(db *sql.DB, serverID int64, viewerID int64, isAdmin
 		rows, err = db.Query(`
             SELECT c.id, c.name, c.domains, c.source, c.cert_pem, c.key_pem, c.cert_path, c.key_path,
                    COALESCE(c.dns_provider,''), COALESCE(c.dns_profile_id,''), COALESCE(c.export_json,''),
+                   COALESCE(c.fleet_distribution_mode,''), COALESCE(c.fleet_push_targets,''),
                    c.owner_id, c.created_at, c.updated_at, COALESCE(u.email, '')
             FROM certificates c
             LEFT JOIN users u ON u.id = c.owner_id
@@ -4366,6 +4486,7 @@ func ListCertificatesForUser(db *sql.DB, serverID int64, viewerID int64, isAdmin
 		rows, err = db.Query(`
             SELECT c.id, c.name, c.domains, c.source, c.cert_pem, c.key_pem, c.cert_path, c.key_path,
                    COALESCE(c.dns_provider,''), COALESCE(c.dns_profile_id,''), COALESCE(c.export_json,''),
+                   COALESCE(c.fleet_distribution_mode,''), COALESCE(c.fleet_push_targets,''),
                    c.owner_id, c.created_at, c.updated_at, COALESCE(u.email, '')
             FROM certificates c
             LEFT JOIN users u ON u.id = c.owner_id
@@ -4382,7 +4503,8 @@ func ListCertificatesForUser(db *sql.DB, serverID int64, viewerID int64, isAdmin
 		var c Certificate
 		if err := rows.Scan(&c.ID, &c.Name, &c.Domains, &c.Source,
 			&c.CertPEM, &c.KeyPEM, &c.CertPath, &c.KeyPath,
-			&c.DNSProvider, &c.DNSProfileID, &c.Export, &c.OwnerID,
+			&c.DNSProvider, &c.DNSProfileID, &c.Export,
+			&c.FleetDistributionMode, &c.FleetPushTargets, &c.OwnerID,
 			&c.CreatedAt, &c.UpdatedAt, &c.OwnerEmail); err != nil {
 			return nil, err
 		}
@@ -4444,11 +4566,14 @@ func GetCertificate(db *sql.DB, id int64) (*Certificate, error) {
 	var c Certificate
 	err := db.QueryRow(`
         SELECT id, name, domains, source, cert_pem, key_pem, cert_path, key_path,
-               COALESCE(dns_provider,''), COALESCE(dns_profile_id,''), COALESCE(export_json,''), owner_id, created_at, updated_at
+               COALESCE(dns_provider,''), COALESCE(dns_profile_id,''), COALESCE(export_json,''),
+               COALESCE(fleet_distribution_mode,''), COALESCE(fleet_push_targets,''),
+               owner_id, created_at, updated_at
         FROM certificates WHERE id = ?`, id).Scan(
 		&c.ID, &c.Name, &c.Domains, &c.Source,
 		&c.CertPEM, &c.KeyPEM, &c.CertPath, &c.KeyPath,
-		&c.DNSProvider, &c.DNSProfileID, &c.Export, &c.OwnerID,
+		&c.DNSProvider, &c.DNSProfileID, &c.Export,
+		&c.FleetDistributionMode, &c.FleetPushTargets, &c.OwnerID,
 		&c.CreatedAt, &c.UpdatedAt,
 	)
 	if err != nil {
@@ -4466,10 +4591,11 @@ func CreateCertificate(db *sql.DB, serverID int64, ownerID int64, c *Certificate
 		c.Source = CertSourcePEM
 	}
 	res, err := db.Exec(`
-        INSERT INTO certificates (server_id, owner_id, name, domains, source, cert_pem, key_pem, cert_path, key_path, dns_provider, dns_profile_id, export_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        INSERT INTO certificates (server_id, owner_id, name, domains, source, cert_pem, key_pem, cert_path, key_path, dns_provider, dns_profile_id, export_json, fleet_distribution_mode, fleet_push_targets)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		serverID, nilIfZero(ownerID), c.Name, c.Domains, c.Source, c.CertPEM, c.KeyPEM,
-		c.CertPath, c.KeyPath, c.DNSProvider, c.DNSProfileID, c.Export)
+		c.CertPath, c.KeyPath, c.DNSProvider, c.DNSProfileID, c.Export,
+		c.FleetDistributionMode, c.FleetPushTargets)
 	if err != nil {
 		return 0, err
 	}
@@ -4482,9 +4608,11 @@ func UpdateCertificate(db *sql.DB, c *Certificate) error {
 	}
 	_, err := db.Exec(`
         UPDATE certificates SET name=?, domains=?, source=?, cert_pem=?, key_pem=?,
-            cert_path=?, key_path=?, dns_provider=?, dns_profile_id=?, export_json=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+            cert_path=?, key_path=?, dns_provider=?, dns_profile_id=?, export_json=?,
+            fleet_distribution_mode=?, fleet_push_targets=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
 		c.Name, c.Domains, c.Source, c.CertPEM, c.KeyPEM, c.CertPath, c.KeyPath,
-		c.DNSProvider, c.DNSProfileID, c.Export, c.ID)
+		c.DNSProvider, c.DNSProfileID, c.Export,
+		c.FleetDistributionMode, c.FleetPushTargets, c.ID)
 	return err
 }
 

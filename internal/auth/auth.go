@@ -23,8 +23,13 @@ const (
 
 type ctxKey string
 
+// bcryptCost is the work factor for NEW password hashes. SECURITY.md has always
+// promised 12; the code used bcrypt.DefaultCost (10) until v2.57.1. Existing
+// hashes keep verifying — the cost is stored inside each hash.
+const bcryptCost = 12
+
 func HashPassword(pw string) (string, error) {
-	h, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
+	h, err := bcrypt.GenerateFromPassword([]byte(pw), bcryptCost)
 	return string(h), err
 }
 
@@ -85,6 +90,14 @@ func CreateSessionWithTTL(db *sql.DB, userID int64, ttl time.Duration) (string, 
 		return "", time.Time{}, err
 	}
 	return tok, expires, nil
+}
+
+// DeleteOtherSessions removes every session of the user except the one
+// identified by the raw cookie token keep. Used when the signed-in user changes
+// their own password: other devices are signed out, this one stays.
+func DeleteOtherSessions(db *sql.DB, userID int64, keep string) error {
+	_, err := db.Exec(`DELETE FROM sessions WHERE user_id = ? AND token != ?`, userID, HashSessionToken(keep))
+	return err
 }
 
 // DeleteSession removes the session identified by the raw cookie token.

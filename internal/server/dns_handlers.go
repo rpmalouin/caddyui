@@ -621,6 +621,18 @@ func classifyVerifyResolver(raw string) (verifyResolverMode, []string) {
 	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
 		return verifyResolverDoHURL, []string{raw}
 	}
+	servers := parsePlainDNSServers(raw)
+	if len(servers) == 0 {
+		return verifyResolverDefault, nil
+	}
+	return verifyResolverPlainDNS, servers
+}
+
+// parsePlainDNSServers splits raw on comma/space/newline/tab into "host:port"
+// DNS server addresses, defaulting to port 53 when none is given. Shared by
+// the verification-resolver (issue #98) and ACME DNS-01 resolver (issue #116)
+// settings, which both accept the same plain-DNS-list syntax.
+func parsePlainDNSServers(raw string) []string {
 	var servers []string
 	for _, f := range strings.FieldsFunc(raw, func(r rune) bool {
 		return r == ',' || r == ' ' || r == '\n' || r == '\t'
@@ -634,10 +646,16 @@ func classifyVerifyResolver(raw string) (verifyResolverMode, []string) {
 		}
 		servers = append(servers, f)
 	}
-	if len(servers) == 0 {
-		return verifyResolverDefault, nil
-	}
-	return verifyResolverPlainDNS, servers
+	return servers
+}
+
+// acmeDNSResolvers returns the admin-configured DNS servers (issue #116) that
+// Caddy's own ACME DNS-01 solver should query for TXT-record propagation
+// checks, instead of the container's default resolver. Returns nil when
+// unset, so Caddy's own default applies.
+func (s *Server) acmeDNSResolvers() []string {
+	raw, _ := models.GetSetting(s.DB, settingACMEDNSResolvers)
+	return parsePlainDNSServers(raw)
 }
 
 // resolveVerifyA resolves A records for fqdn using the admin-configured
@@ -1006,7 +1024,9 @@ func (s *Server) rawRouteDeploying(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	fqdn := firstRawRouteHost(rr.JSONData)
-	if fqdn == "" {
+	// Issue #121: no host to probe, or a plain-HTTP route (explicit http://
+	// address) — there is no HTTPS certificate to wait for, so skip the page.
+	if fqdn == "" || rawRouteHTTPOnly(rr) {
 		http.Redirect(w, r, "/raw-routes", http.StatusSeeOther)
 		return
 	}
@@ -1159,6 +1179,7 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	lang := s.requestLocale(r, s.currentUser(r)) // v2.63.0: section names in the reader's language
 	webhookURL, _ := models.GetSetting(s.DB, settingNotifyWebhookURL)
 	// v2.12.51: ntfy.sh push channel — load alongside the existing webhook.
 	ntfyURL, _ := models.GetSetting(s.DB, settingNotifyNtfyURL)
@@ -1428,6 +1449,8 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 		"CFProxied":  cfProxiedStr == "1",
 		// issue #98: verification resolver override for deploy/readiness checks.
 		"DNSVerifyResolver": mustGetSetting(s.DB, settingDNSVerifyResolver),
+		// issue #116: resolver override for Caddy's own ACME DNS-01 challenge.
+		"ACMEDNSResolvers": mustGetSetting(s.DB, settingACMEDNSResolvers),
 		// issue #100: fleet-wide IP blocklist.
 		"GlobalIPBlocklist": mustGetSetting(s.DB, settingGlobalIPBlocklist),
 		// issue #104: scheduled backups.
@@ -1446,8 +1469,15 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 		"OIDCRedirectURL":     mustGetSetting(s.DB, settingOIDCRedirectURL),
 		"OIDCAutoCreate":      mustGetSetting(s.DB, settingOIDCAutoCreate) == "1",
 		"OIDCButtonLabel":     mustGetSetting(s.DB, settingOIDCButtonLabel),
-		"Success":             success,
-		"ClearedName":         clearedName,
+		// v2.65.0 (issue #139): role assignment for auto-created SSO users,
+		// plus the exact callback URL spelled out where it cannot be clipped
+		// by the width of the input it belongs to.
+		"OIDCDefaultRole":          mustGetSetting(s.DB, settingOIDCDefaultRole),
+		"OIDCGroupsClaim":          mustGetSetting(s.DB, settingOIDCGroupsClaim),
+		"OIDCRoleMappings":         mustGetSetting(s.DB, settingOIDCRoleMappings),
+		"OIDCSuggestedRedirectURL": s.publicBaseURL(r) + "/auth/oidc/callback",
+		"Success":                  success,
+		"ClearedName":              clearedName,
 		// v2.7.0: analytics card
 		"AnalyticsEnabled":           analyticsCfg.Enabled,
 		"ExpectationsAutoRollback":   expectationsAutoRollbackEnabled(s), // v2.38.0
@@ -1483,9 +1513,15 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 		"MetricsObserveCatchAll":  metricsCfg.ObserveCatchAllHost,
 		"MetricsServerSelected":   integrationServerSelection(caddyServers, metricsCfg.ServerIDs),
 		"MetricsScrapeTargets":    metricsScrapeTargets,
-		// v2.9.5: 2FA enforcement policy
-		"Require2FA":  mustGetSetting(s.DB, settingRequire2FA),
-		"RequireTOTP": mustGetSetting(s.DB, settingRequireTOTP),
+		// v2.64.1 (issue #138): one two-factor policy toggle. Reflects either
+		// key so an install that only ever set the deprecated one still shows
+		// the switch as on.
+		"RequireTOTP": func() string {
+			if s.twoFactorRequired() {
+				return "1"
+			}
+			return "0"
+		}(),
 		// v2.10.0: trusted proxies + custom site title
 		"TrustedProxies": mustGetSetting(s.DB, settingTrustedProxies),
 		"SiteTitle":      mustGetSetting(s.DB, settingSiteTitle),
@@ -1497,9 +1533,24 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 		// v2.11.0: custom favicon + admin IP allowlist
 		"FaviconURL":     mustGetSetting(s.DB, settingFaviconURL),
 		"AdminAllowlist": mustGetSetting(s.DB, settingAdminAllowlist),
+		// v2.65.0 (issue #140): the address this request arrived with, so the
+		// operator can see what the allowlist will actually be matching
+		// before they save a list that might exclude them.
+		"CurrentClientIP": func() string {
+			ip, _ := s.resolvedClientIP(r)
+			return ip
+		}(),
+		"CurrentClientIPViaProxy": func() bool {
+			_, viaProxy := s.resolvedClientIP(r)
+			return viaProxy
+		}(),
+		"AdminAllowlistFromEnv": s.adminAllowlistFromEnv(),
 		// v2.12.0: configurable session duration + global catch-all 404
 		"SessionDays":          mustGetSetting(s.DB, settingSessionDays),
 		"CatchAll404HTML":      mustGetSetting(s.DB, settingCatchAll404HTML),
+		"FallbackStatus":       s.fallbackStatusCode(),                     // v2.60.0 (issue #123)
+		"DefaultLocale":        mustGetSetting(s.DB, settingDefaultLocale), // v2.62.0 (issue #128)
+		"Locales":              translations().Locales(),
 		"GlobalMaintenance":    mustGetSetting(s.DB, settingGlobalMaintenance),
 		"AutoSyncHours":        mustGetSetting(s.DB, settingAutoSyncHours),
 		"ActivityLogDays":      mustGetSetting(s.DB, settingActivityLogDays),
@@ -1507,11 +1558,23 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 		"DisableHTTP3":         mustGetSetting(s.DB, settingDisableHTTP3),
 		"DatabaseBackend":      string(appdb.BackendOf(s.DB)),
 		"Section":              "settings",
-		"SettingsSection":      settingsPage,                       // v2.44.0
-		"SettingsSectionLabel": settingsSectionLabel(settingsPage), // v2.44.0
-		"SettingsNav":          settingsSections,                   // v2.44.0
-		"SettingsAnchorsJSON":  settingsAnchorsJSON(),              // v2.44.0
+		"SettingsSection":      settingsPage,                                      // v2.44.0
+		"SettingsSectionLabel": localizedSettingsSectionLabel(lang, settingsPage), // v2.44.0; v2.63.0 translated
+		"SettingsNav":          localizedSettingsSections(lang),                   // v2.44.0; v2.63.0 translated
+		"SettingsAnchorsJSON":  settingsAnchorsJSON(),                             // v2.44.0
 	})
+}
+
+// requireTOTPFormValue reads the single two-factor policy toggle from the
+// settings form. The two toggles it replaces used different checkbox
+// conventions — one value="1", one bare "on" — so both are accepted rather
+// than letting a stale form silently save "off". v2.64.1 (issue #138).
+func requireTOTPFormValue(r *http.Request) string {
+	switch r.FormValue("require_totp") {
+	case "1", "on":
+		return "1"
+	}
+	return "0"
 }
 
 func (s *Server) postSettings(w http.ResponseWriter, r *http.Request) {
@@ -1519,6 +1582,14 @@ func (s *Server) postSettings(w http.ResponseWriter, r *http.Request) {
 	// v2.44.0: the posted page owns a subset of keys; "" is the legacy
 	// whole-form post (API clients, old bookmarks) and saves everything.
 	settingsPage := settingsSectionSlug(r.FormValue("settings_section"))
+	// v2.65.0 (issue #139): a group rule naming a role CaddyUI does not have
+	// is ignored at sign-in time, which would mean saving a mapping that
+	// quietly never applies. Say so instead.
+	if bad := invalidOIDCRoleMappingLines(r.FormValue("oidc_role_mappings")); len(bad) > 0 {
+		http.Error(w, "Group → role rules: "+strings.Join(bad, "; ")+
+			". Use one `group|role` per line, with role being admin, user or view.", http.StatusBadRequest)
+		return
+	}
 	integrationSettingsPresent := r.FormValue("fleet_integrations_present") == "1"
 	accessLogFormCfg := loadFleetAccessLogConfig(s.DB)
 	crowdSecFormCfg := loadCrowdSecConfig(s.DB)
@@ -1724,6 +1795,7 @@ func (s *Server) postSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	kv := map[string]string{
 		settingDNSVerifyResolver: strings.TrimSpace(r.FormValue("dns_verify_resolver")), // issue #98
+		settingACMEDNSResolvers:  strings.TrimSpace(r.FormValue("acme_dns_resolvers")),  // issue #116
 		settingGlobalIPBlocklist: strings.TrimSpace(r.FormValue("global_ip_blocklist")), // issue #100
 		// issue #104: scheduled off-host backups.
 		settingBackupScheduleEnabled:  backupSchedEnabled,
@@ -1731,12 +1803,24 @@ func (s *Server) postSettings(w http.ResponseWriter, r *http.Request) {
 		settingBackupScheduleInterval: strings.TrimSpace(r.FormValue("backup_schedule_interval_hours")),
 		settingBackupScheduleKeep:     strings.TrimSpace(r.FormValue("backup_schedule_keep")),
 		// issue #106: OIDC / SSO login (client secret handled below, keep-blank).
-		settingOIDCEnabled:         oidcEnabled,
-		settingOIDCIssuer:          strings.TrimSpace(r.FormValue("oidc_issuer")),
-		settingOIDCClientID:        strings.TrimSpace(r.FormValue("oidc_client_id")),
-		settingOIDCRedirectURL:     strings.TrimSpace(r.FormValue("oidc_redirect_url")),
-		settingOIDCAutoCreate:      oidcAutoCreate,
-		settingOIDCButtonLabel:     strings.TrimSpace(r.FormValue("oidc_button_label")),
+		settingOIDCEnabled:     oidcEnabled,
+		settingOIDCIssuer:      strings.TrimSpace(r.FormValue("oidc_issuer")),
+		settingOIDCClientID:    strings.TrimSpace(r.FormValue("oidc_client_id")),
+		settingOIDCRedirectURL: strings.TrimSpace(r.FormValue("oidc_redirect_url")),
+		settingOIDCAutoCreate:  oidcAutoCreate,
+		settingOIDCButtonLabel: strings.TrimSpace(r.FormValue("oidc_button_label")),
+		// v2.65.0 (issue #139). An unrecognised role is stored as "" so
+		// oidcConfig.defaultRole falls back to view, rather than persisting
+		// something no permission check understands.
+		settingOIDCDefaultRole: func() string {
+			role := strings.ToLower(strings.TrimSpace(r.FormValue("oidc_default_role")))
+			if !validOIDCRole(role) {
+				return ""
+			}
+			return role
+		}(),
+		settingOIDCGroupsClaim:     strings.TrimSpace(r.FormValue("oidc_groups_claim")),
+		settingOIDCRoleMappings:    strings.TrimSpace(r.FormValue("oidc_role_mappings")),
 		settingNotifyWebhookURL:    webhookURL,
 		settingNotifyWebhookSecret: webhookSecret,
 		settingNotifyNtfyURL:       ntfyURL, // v2.12.51
@@ -1798,19 +1882,22 @@ func (s *Server) postSettings(w http.ResponseWriter, r *http.Request) {
 			}
 			return "0"
 		}(),
-		// v2.9.5: 2FA enforcement policy (checkbox → "on" when checked).
-		settingRequire2FA: func() string {
-			if r.FormValue("require_2fa") == "on" {
-				return "1"
+		// v2.64.1 (issue #138): one toggle, written to both keys. The form
+		// field is require_totp; settingRequire2FA is its deprecated twin and
+		// is kept in step so a downgrade still enforces the policy. Accepts
+		// either checkbox convention ("1" or "on") because the two old
+		// toggles used one each.
+		settingRequireTOTP: requireTOTPFormValue(r),
+		settingRequire2FA:  requireTOTPFormValue(r),
+		// v2.64.2 (issue #138): switching the policy on retires any earlier
+		// "I don't want this" acknowledgement, so turning it off again later
+		// raises the recommendation afresh instead of staying silently
+		// dismissed from a decision made months ago.
+		settingTOTPPolicyDismissed: func() string {
+			if requireTOTPFormValue(r) == "1" {
+				return "0"
 			}
-			return "0"
-		}(),
-		// require_totp toggle uses value="1" checkbox pattern.
-		settingRequireTOTP: func() string {
-			if r.FormValue("require_totp") == "1" {
-				return "1"
-			}
-			return "0"
+			return mustGetSetting(s.DB, settingTOTPPolicyDismissed)
 		}(),
 		settingSMTPPort:         smtpPort,
 		settingSMTPUsername:     smtpUsername,
@@ -1860,6 +1947,27 @@ func (s *Server) postSettings(w http.ResponseWriter, r *http.Request) {
 		if key := strings.TrimSpace(r.FormValue("crowdsec_api_key")); key != "" {
 			kv[settingCrowdSecAPIKey] = key
 		}
+	}
+	// v2.60.0 (issue #123): fallback status for unmatched requests, 4xx/5xx only.
+	if _, present := r.Form["fallback_status_code"]; present || r.PostForm.Has("fallback_status_code") {
+		raw := strings.TrimSpace(r.FormValue("fallback_status_code"))
+		if raw == "" {
+			kv[settingFallbackStatus] = ""
+		} else if n, ok := parseFallbackStatus(raw); ok {
+			kv[settingFallbackStatus] = strconv.Itoa(n)
+		} else {
+			http.Error(w, "Fallback status code must be a number from 400 to 599", http.StatusBadRequest)
+			return
+		}
+	}
+	// v2.62.0 (issue #128): site default language; only known catalogs.
+	if _, present := r.Form["default_locale"]; present {
+		loc := strings.TrimSpace(r.FormValue("default_locale"))
+		if loc != "" && !translations().Has(loc) {
+			http.Error(w, "Unknown language", http.StatusBadRequest)
+			return
+		}
+		kv[settingDefaultLocale] = loc
 	}
 	if sessionDays := strings.TrimSpace(r.FormValue("session_duration_days")); sessionDays != "" {
 		kv[settingSessionDays] = sessionDays

@@ -4,6 +4,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -111,13 +112,22 @@ func (s *Server) parseRawRouteForm(r *http.Request) (*models.RawRoute, string) {
 			}
 		}
 	}
+	forceSSL := r.FormValue("ssl_forced") == "on"
+	// Issue #121: an Advanced route written with explicit http:// site
+	// addresses is a deliberate plain-HTTP route. A certificate has nothing to
+	// bind to and a forced HTTPS redirect would contradict the address, so
+	// neither is kept — the form disables both controls for it.
+	if cfSrc != "" && caddy.CaddyfileHTTPOnly(cfSrc) {
+		certID = 0
+		forceSSL = false
+	}
 	return &models.RawRoute{
 		Label:               label,
 		JSONData:            body,
 		CaddyfileSrc:        cfSrc,
 		Enabled:             r.FormValue("enabled") == "on",
 		CertificateID:       certID,
-		ForceSSL:            r.FormValue("ssl_forced") == "on",
+		ForceSSL:            forceSSL,
 		BlockCommonExploits: r.FormValue("block_common_exploits") == "on",
 		NodeLocal:           r.FormValue("node_local") == "on", // v2.33.0
 		Listen:              listen,                            // v2.36.1 (issue #64)
@@ -128,6 +138,75 @@ func (s *Server) parseRawRouteForm(r *http.Request) (*models.RawRoute, string) {
 		DNSSkipRecord:       provider != "" && r.FormValue("dns_create_record") != "on",
 	}, ""
 }
+
+// rawRouteHTTPOnly reports whether rr was written with explicit http:// site
+// addresses (issue #121). Such a route is served as plain HTTP: it needs no
+// certificate, so there is nothing for the "deploying" page to wait on.
+func rawRouteHTTPOnly(rr *models.RawRoute) bool {
+	return rr != nil && rr.CaddyfileSrc != "" && caddy.CaddyfileHTTPOnly(rr.CaddyfileSrc)
+}
+
+// httpsRawRoutes returns the Advanced routes that belong on the HTTPS listener
+// (srv0, :443) — every enabled route except those written with explicit
+// http:// site addresses (v2.59.3, issue #121). The #121 fix only dropped the
+// certificate and Force SSL for such a route on save; the route itself was
+// still generated on :443, where Caddy served it over HTTPS and issued an
+// internal certificate for its host. Routes with their own listener are
+// unaffected (they never share srv0), and the list for the plain :80 server is
+// built from the full set, so an http:// route still reaches :80.
+func httpsRawRoutes(raws []models.RawRoute) []models.RawRoute {
+	out := make([]models.RawRoute, 0, len(raws))
+	for i := range raws {
+		if raws[i].Listen == "" && rawRouteHTTPOnly(&raws[i]) {
+			continue
+		}
+		out = append(out, raws[i])
+	}
+	return out
+}
+
+// withAutoLoadedSnippets prepends the snippet definitions — "(name) { ... }" —
+// found in the mounted Caddyfile (CADDYFILE_PATH) to src, so `import <name>`
+// resolves without the user pasting the definition. Only the snippet blocks
+// themselves are added — never site blocks or the global options block, which
+// would duplicate existing routes or clash with Caddy's single global-options
+// restriction. A snippet src already defines is skipped, to avoid Caddy's
+// duplicate-definition error. If CADDYFILE_PATH is unset or unreadable, or
+// holds no snippets, src is returned unchanged.
+//
+// Every path that hands user-written Caddyfile text to /adapt must go through
+// this: Advanced routes, the Caddyfile paste importer, and a proxy host's
+// Advanced config (issue #119 — that last one was missed and rejected any
+// `import <snippet>` with "File to import not found").
+func (s *Server) withAutoLoadedSnippets(src string) string {
+	if s.CaddyfilePath == "" {
+		return src
+	}
+	b, err := os.ReadFile(s.CaddyfilePath)
+	if err != nil {
+		return src
+	}
+	already := map[string]bool{}
+	for _, snip := range caddy.ExtractSnippets(src) {
+		already[caddy.HeadOfBlock(snip)] = true
+	}
+	var loaded []string
+	for _, snip := range caddy.ExtractSnippets(string(b)) {
+		if !already[caddy.HeadOfBlock(snip)] {
+			loaded = append(loaded, snip)
+		}
+	}
+	if len(loaded) == 0 {
+		return src
+	}
+	return strings.Join(loaded, "\n\n") + "\n\n" + src
+}
+
+// errClientAuthInRawRoute marks the one rejection adaptRawRouteCaddyfile makes
+// on its own account rather than relaying from Caddy, so callers can avoid
+// blaming Caddy for a block it adapted perfectly well. v2.64.0 (discussion
+// #137).
+var errClientAuthInRawRoute = errors.New("this block configures client certificate authentication (mTLS), which an Advanced route cannot carry")
 
 // adaptRawRouteCaddyfile sends a Caddyfile block (the `caddyfile_src` field of a
 // raw_route) through Caddy's /adapt, prepending auto-loaded snippets from the
@@ -140,31 +219,20 @@ func (s *Server) parseRawRouteForm(r *http.Request) (*models.RawRoute, string) {
 // all serve on the union of those ports — split them into separate Advanced
 // routes to keep them apart.
 func (s *Server) adaptRawRouteCaddyfile(caddyCl *caddy.Client, src string) (string, string, error) {
-	var loadedSnippets []string
-	if s.CaddyfilePath != "" {
-		if b, err := os.ReadFile(s.CaddyfilePath); err == nil {
-			already := map[string]bool{}
-			for _, snip := range caddy.ExtractSnippets(src) {
-				already[caddy.HeadOfBlock(snip)] = true
-			}
-			for _, snip := range caddy.ExtractSnippets(string(b)) {
-				if !already[caddy.HeadOfBlock(snip)] {
-					loadedSnippets = append(loadedSnippets, snip)
-				}
-			}
-		}
-	}
-	full := src
-	if len(loadedSnippets) > 0 {
-		full = strings.Join(loadedSnippets, "\n\n") + "\n\n" + src
-	}
-	adapted, err := caddyCl.Adapt(full)
+	adapted, err := caddyCl.Adapt(s.withAutoLoadedSnippets(src))
 	if err != nil {
 		return "", "", err
 	}
 	adaptedRoutes := extractAdaptedServerRoutes(adapted.Result)
 	if len(adaptedRoutes) == 0 {
 		return "", "", fmt.Errorf("the Caddyfile adapted successfully but produced no HTTP routes — include at least one site block")
+	}
+	// v2.64.0 (discussion #137): an Advanced route stores routes only, so a
+	// `tls { client_auth ... }` block here would be dropped on the floor and
+	// the site would serve happily without ever asking for a certificate.
+	// Refuse the save and name the setting that works instead.
+	if snis := adaptedClientAuthSNIs(adapted.Result); len(snis) > 0 {
+		return "", "", fmt.Errorf("%w (affects %s). Caddy keeps client_auth in the server's TLS connection policies, not in the route, and an Advanced route stores routes only — so it would be discarded here and the site would accept any visitor. Configure it on the proxy host instead — Proxy Hosts → edit → Security → Client certificate authentication — and keep the rest of this block for the routing", errClientAuthInRawRoute, strings.Join(snis, ", "))
 	}
 	var addrs []string
 	routes := make([]map[string]any, 0, len(adaptedRoutes))
@@ -185,6 +253,35 @@ func (s *Server) adaptRawRouteCaddyfile(caddyCl *caddy.Client, src string) (stri
 		return "", "", fmt.Errorf("serialize routes: %w", err)
 	}
 	return string(blob), listen, nil
+}
+
+// buildLayer4App adapts a server's pasted layer4 Caddyfile block (the
+// CaddyServer.Layer4Caddyfile field, issue #113) through that server's own
+// admin API and returns only the resulting apps.layer4 subtree — never any
+// other key the adapt response might contain, even if the pasted block
+// happens to produce one (see extractAdaptedLayer4App). caddyCl must already
+// be the client for the server whose text is being adapted: sync callers
+// pass the per-server-swapped s.Caddy, the save-time validator and
+// cross-deploy both build a fresh client from the target server's own
+// AdminURL/credentials.
+//
+// An empty caddyfileSrc (the default, and today's behavior for every
+// existing server) returns (nil, nil) without making an admin-API call at
+// all — no block configured, nothing to adapt. A non-2xx response from
+// Caddy (unknown "layer4" directive because caddy-l4 isn't compiled in,
+// Caddyfile syntax error, etc.) is returned as-is from caddy.Client.Adapt,
+// which already includes Caddy's diagnostic text — callers surface this as a
+// clear, actionable error rather than silently dropping the block.
+func buildLayer4App(caddyCl *caddy.Client, caddyfileSrc string) (map[string]any, error) {
+	src := strings.TrimSpace(caddyfileSrc)
+	if src == "" {
+		return nil, nil
+	}
+	adapted, err := caddyCl.Adapt(src)
+	if err != nil {
+		return nil, err
+	}
+	return extractAdaptedLayer4App(adapted.Result), nil
 }
 
 // previewRawRouteValidate simulates syncCaddy with rr swapped into the raw_routes
@@ -218,6 +315,7 @@ func (s *Server) previewRawRouteValidate(serverID int64, rr *models.RawRoute) st
 // forms as well as Advanced routes.
 func (s *Server) validateProposedConfig(serverID int64, proxies []models.ProxyHost, redirs []models.RedirectionHost, raws []models.RawRoute, certs []models.Certificate) string {
 	caddyCl := s.caddyForServer(serverID)
+	proxies = s.applyMiddlewareProfiles(proxies) // v2.60.0 (issue #124)
 	current, _, err := caddyCl.FetchConfig()
 	if err != nil {
 		return ""
@@ -226,7 +324,9 @@ func (s *Server) validateProposedConfig(serverID int64, proxies []models.ProxyHo
 	if err != nil {
 		return ""
 	}
-	previewRoutes := append(s.buildMergedRoutes(proxies, redirs, raws), buildManagedCertificateRoutes(certs)...)
+	previewRoutes := append(s.buildMergedRoutes(proxies, redirs, httpsRawRoutes(raws)), buildManagedCertificateRoutes(certs, s.fallbackRoute()["handle"].([]any))...)
+	previewRoutes = sortRoutesBySpecificity(previewRoutes) // v2.61.3 (issue #129): wildcard certificate routes after exact hosts
+	previewRoutes = s.withFallbackRoute(previewRoutes)     // v2.59.4 (issue #123)
 	httpRoutes := s.buildHTTPRoutes(proxies, redirs, raws)
 	// Mirror syncCaddy's plain-HTTP ownership check so a preview validates the
 	// same document the real sync would push.
@@ -244,11 +344,11 @@ func (s *Server) validateProposedConfig(serverID int64, proxies []models.ProxyHo
 	applyRawListenServers(proposed, s.buildRawListenServers(raws)) // v2.36.1 (issue #64)
 	loadPEM, loadFiles := buildCertLoaders(certs)
 	applyCertLoaders(proposed, loadPEM, loadFiles)
-	applySkipCertificates(proposed, buildSkipCertificates(proxies, redirs, raws, certs))
+	applySkipCertificates(proposed, buildSkipCertificates(proxies, redirs, httpsRawRoutes(raws), certs))
 	removeUnsupportedSkipRedirects(proposed)
 	applyDisableAutomaticHTTPSRedirects(proposed, plainHTTPForeign || len(httpRoutes) > 0)
 	applySkipAccessLogs(proposed, buildSkipAccessLogs(proxies))
-	previewPolicies := s.buildDNSAutomationPolicies(proxies, redirs, raws, certs)
+	previewPolicies := s.buildDNSAutomationPolicies(proxies, redirs, httpsRawRoutes(raws), certs)
 	previewPolicies = append(previewPolicies, buildInternalTLSAutomationPolicies(proxies)...) // v2.46.0
 	applyAutomationPolicies(proposed, previewPolicies)
 	// Mirror syncCaddy: preview-validation must match the config we'd push
@@ -256,7 +356,7 @@ func (s *Server) validateProposedConfig(serverID int64, proxies []models.ProxyHo
 	// fail with errors.routes rejection at sync time.
 	applyErrorPages(proposed)
 	if err := caddyCl.Validate(proposed); err != nil {
-		return "Caddy rejected the proposed config: " + err.Error()
+		return "Caddy rejected the proposed config: " + friendlyCaddyError(err.Error())
 	}
 	return ""
 }
@@ -264,6 +364,10 @@ func (s *Server) validateProposedConfig(serverID int64, proxies []models.ProxyHo
 func (s *Server) createRawRoute(w http.ResponseWriter, r *http.Request) {
 	rr, errMsg := s.parseRawRouteForm(r)
 	if errMsg != "" {
+		s.renderRawRouteFormError(w, r, rr, errMsg)
+		return
+	}
+	if errMsg := s.validateRawRouteForUser(s.currentUser(r), rr); errMsg != "" { // v2.57.1 — see tenant_guard.go
 		s.renderRawRouteFormError(w, r, rr, errMsg)
 		return
 	}
@@ -315,14 +419,14 @@ func (s *Server) createRawRoute(w http.ResponseWriter, r *http.Request) {
 	// rr.ID must be set so upsertFleetRawRoute can key the fleet mapping off
 	// the source row. RawRoute carries no ServerID field — the source server
 	// is passed separately, as in the proxy/redirect cross-deploy paths.
-	if deployTo := parseDeployTo(r); len(deployTo) > 0 {
+	if deployTo := s.effectiveDeployTargets(s.currentServerID(r), parseDeployTo(r)); len(deployTo) > 0 {
 		rr.ID = id
 		s.crossDeployRawRoute(s.currentUserEmail(r), s.currentServerID(r), rr, deployTo)
 	}
 	// v2.5.5: park the user on the deploying checklist when the route has
 	// a host matcher we can probe. Path-only / port-only routes have no
 	// fqdn to verify, so we skip the page and bounce to the list like before.
-	if firstRawRouteHost(rr.JSONData) != "" {
+	if firstRawRouteHost(rr.JSONData) != "" && !rawRouteHTTPOnly(rr) {
 		http.Redirect(w, r, fmt.Sprintf("/raw-routes/%d/deploying", id), http.StatusSeeOther)
 		return
 	}
@@ -421,6 +525,10 @@ func (s *Server) updateRawRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rr.ID = id
+	if errMsg := s.validateRawRouteForUser(s.currentUser(r), rr); errMsg != "" { // v2.57.1 — see tenant_guard.go
+		s.renderRawRouteFormError(w, r, rr, errMsg)
+		return
+	}
 	s.applyRawDNSFormSelection(rr)
 	// v2.7.8: zone/hostname match — same as create path. Routes with no host
 	// matcher skip the check (rawRouteHosts returns nil → validator returns "").
@@ -503,14 +611,14 @@ func (s *Server) updateRawRoute(w http.ResponseWriter, r *http.Request) {
 	_ = models.LogActivity(s.DB, s.currentServerID(r), s.currentUserEmail(r), "raw_update", fmt.Sprintf("raw:%d", id), rr.Label, true)
 	s.trySyncCaddy(s.currentServerID(r), forceTLS)
 	// v2.27.0 (issue #38): re-deploy the edited route to any selected targets.
-	if deployTo := parseDeployTo(r); len(deployTo) > 0 {
+	if deployTo := s.effectiveDeployTargets(s.currentServerID(r), parseDeployTo(r)); len(deployTo) > 0 {
 		s.crossDeployRawRoute(s.currentUserEmail(r), s.currentServerID(r), rr, deployTo)
 	}
 	// v2.5.5: show the deploying checklist on edits too — changing the
 	// host matcher or the backing service is the same "did it come back
 	// up on HTTPS?" question the create flow asks. Routes without a host
 	// matcher skip the page as in create.
-	if newFQDN != "" {
+	if newFQDN != "" && !rawRouteHTTPOnly(rr) { // issue #121: an http:// route has no certificate to wait for
 		http.Redirect(w, r, fmt.Sprintf("/raw-routes/%d/deploying", id), http.StatusSeeOther)
 		return
 	}
@@ -547,13 +655,18 @@ func (s *Server) deleteRawRoute(w http.ResponseWriter, r *http.Request) {
 	if old != nil && old.DNSRecordID != "" {
 		s.dnsDeleteRecord(old.DNSProvider, old.DNSProfileID, old.DNSZoneID, old.DNSZoneName, old.DNSRecordID)
 	}
+	note := s.noteFleetDeletion(models.FleetResourceRawRoute, id, "")
+	if old != nil {
+		note.label = old.Label
+	}
 	if err := models.DeleteRawRoute(s.DB, id); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	_ = models.LogActivity(s.DB, s.currentServerID(r), s.currentUserEmail(r), "raw_delete", fmt.Sprintf("raw:%d", id), "", true)
 	forceTLS := old != nil && old.CertificateID != 0
-	s.trySyncCaddy(s.currentServerID(r), forceTLS)
+	s.trySyncCaddyAfterDelete(s.currentServerID(r), forceTLS)
+	s.propagateNotedDeletion(s.currentUserEmail(r), note) // v2.59.0 (issue #120)
 	http.Redirect(w, r, "/raw-routes", http.StatusSeeOther)
 }
 
@@ -614,6 +727,15 @@ func (s *Server) postReclassifyRawRoutes(w http.ResponseWriter, r *http.Request)
 		if len(classified.Proxies) == 1 {
 			ph := classified.Proxies[0]
 			ph.Enabled = row.Enabled
+			// GHSA-r4wm-rgc5-q834 (3rd finding) follow-up: ph.ForwardHost
+			// comes from the existing raw route's own JSON, which a non-admin
+			// could have pasted in before ever being classified as a proxy
+			// host — needs the same non-admin upstream guard as every other
+			// proxy-host creation path.
+			if msg := s.validateProxyUpstreamsForUser(cu, &ph); msg != "" {
+				nKept++
+				continue
+			}
 			if _, err := models.CreateProxyHost(s.DB, s.currentServerID(r), ownerID, &ph); err != nil {
 				nKept++
 				continue
@@ -805,6 +927,14 @@ func (s *Server) pruneActivityLog() {
 // the DB write succeeded but the live config never updated AND nothing
 // was logged. Now every silent caller funnels through this helper so the
 // failure at least lands in `docker logs caddyui`.
+// trySyncCaddyAfterDelete is trySyncCaddy for the delete handlers: removing the
+// last resource must clear it from the live Caddy too (v2.59.1, issue #120).
+func (s *Server) trySyncCaddyAfterDelete(serverID int64, forceTLS bool) {
+	if err := s.syncCaddyOpts(serverID, forceTLS, true); err != nil {
+		log.Printf("trySyncCaddyAfterDelete(server=%d, forceTLS=%v): %v", serverID, forceTLS, err)
+	}
+}
+
 func (s *Server) trySyncCaddy(serverID int64, forceTLS bool) {
 	if err := s.syncCaddy(serverID, forceTLS); err != nil {
 		log.Printf("trySyncCaddy(server=%d, forceTLS=%v): %v", serverID, forceTLS, err)
@@ -841,12 +971,73 @@ func (s *Server) syncPrometheusMetricsOnly(serverID int64, metricsCfg prometheus
 	return nil
 }
 
+// syncLayer4Only handles fleet members with a layer4 Caddyfile block
+// configured (issue #113) but no CaddyUI-managed routes or certificates yet.
+// apps.layer4 is a standalone top-level app independent of apps.http.servers
+// — like Prometheus metrics above — so it should work on a route-less server
+// without forcing the administrator to create a dummy host first.
+func (s *Server) syncLayer4Only(serverID int64, srv *models.CaddyServer, proxies []models.Layer4Proxy) error {
+	// v2.58.0 (issue #122): the raw Caddyfile block plus the managed Layer4
+	// proxy rows.
+	layer4App, err := layer4AppFor(s.Caddy, srv, proxies)
+	if err != nil {
+		return fmt.Errorf("layer4 Caddyfile: %w", err)
+	}
+	current, currentJSON, err := s.Caddy.FetchConfig()
+	if err != nil {
+		return fmt.Errorf("fetch current config for layer4: %w", err)
+	}
+	proposed, err := deepCopyMap(current)
+	if err != nil {
+		return fmt.Errorf("clone config for layer4: %w", err)
+	}
+	applyLayer4App(proposed, layer4App)
+	s.applyLayer4ListenerWrappers(proposed, serverID, proxies) // v2.61.0 (issue #126)
+	if err := s.Caddy.Validate(proposed); err != nil {
+		return fmt.Errorf("caddy rejected layer4 config: %w", err)
+	}
+	if s.autoSnapshotsEnabled() && currentJSON != "" && currentJSON != "null" {
+		if _, err := models.CreateSnapshot(s.DB, serverID, models.SnapshotSourceAuto, "auto: before layer4 sync", currentJSON); err != nil {
+			log.Printf("layer4 snapshot failed (non-fatal): %v", err)
+		}
+	}
+	if err := s.writeLayer4App(proposed); err != nil {
+		_ = models.LogActivity(s.DB, serverID, "system", "sync_apply_layer4_failed", "", err.Error(), false)
+		return fmt.Errorf("apply layer4 app: %w", err)
+	}
+	if err := s.writeLayer4ListenerWrappers(serverID, proxies); err != nil {
+		_ = models.LogActivity(s.DB, serverID, "system", "sync_apply_layer4_wrappers_failed", "", err.Error(), false)
+		return fmt.Errorf("apply layer4 listener wrappers: %w", err)
+	}
+	_ = models.LogActivity(s.DB, serverID, "system", "sync_layer4_applied", "", "layer4-only sync", true)
+	return nil
+}
+
 // syncCaddy pushes the DB state for serverID to its Caddy and records the
 // outcome per server (v2.42.1, issue #74): a failure shows on every page
 // until the next successful sync, so a rejected change can no longer fail
 // silently in the log while the form says "saved".
 func (s *Server) syncCaddy(serverID int64, forceTLS bool) error {
-	err := s.syncCaddyInner(serverID, forceTLS)
+	return s.syncCaddyOpts(serverID, forceTLS, false)
+}
+
+// syncCaddyOpts is syncCaddy with one extra switch. allowEmpty (v2.59.1, issue
+// #120) lets a sync run when CaddyUI holds NO entries for the server: the
+// normal "refusing to push empty routes" guard exists so a fresh or wiped
+// database can never blank a live Caddy, but after an explicit deletion of the
+// last resource the empty state is the intended one and must reach Caddy, or
+// the deleted route would keep serving. Only deletion paths pass true.
+func (s *Server) syncCaddyOpts(serverID int64, forceTLS, allowEmpty bool) error {
+	// Security/stability (v2.57.1): syncCaddyInner points the shared s.Caddy
+	// field at ONE server's admin API for its whole duration. Two syncs for
+	// different servers running at once overwrote each other's client, and a
+	// reproduction pushed server B's routes — with their certificate keys and
+	// basic-auth hashes — to server A (91 of 120 syncs in a stress run). Syncs
+	// are therefore serialized. Nothing reachable from a sync calls syncCaddy
+	// again, so this cannot deadlock.
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+	err := s.syncCaddyInner(serverID, forceTLS, allowEmpty)
 	if err == nil {
 		s.clearSyncError(serverID)
 		return nil
@@ -861,7 +1052,7 @@ func (s *Server) syncCaddy(serverID int64, forceTLS bool) error {
 	return err
 }
 
-func (s *Server) syncCaddyInner(serverID int64, forceTLS bool) error {
+func (s *Server) syncCaddyInner(serverID int64, forceTLS, allowEmpty bool) error {
 	// Load the target server so we can use its AdminURL for the Caddy client.
 	srv, err := models.GetCaddyServer(s.DB, serverID)
 	if err != nil {
@@ -893,6 +1084,7 @@ func (s *Server) syncCaddyInner(serverID int64, forceTLS bool) error {
 	if err != nil {
 		return err
 	}
+	proxies = s.applyMiddlewareProfiles(proxies) // v2.60.0 (issue #124)
 	redirs, err := models.ListRedirectionHosts(s.DB, serverID, 0, true, nil)
 	if err != nil {
 		return err
@@ -905,9 +1097,26 @@ func (s *Server) syncCaddyInner(serverID int64, forceTLS bool) error {
 	if err != nil {
 		return err
 	}
-	if len(proxies) == 0 && len(redirs) == 0 && len(raws) == 0 && len(certs) == 0 {
+	layer4Proxies, err := models.ListLayer4Proxies(s.DB, serverID)
+	if err != nil {
+		return err
+	}
+	if !allowEmpty && len(proxies) == 0 && len(redirs) == 0 && len(raws) == 0 && len(certs) == 0 {
 		if metricsCfg.manages(serverID) {
 			return s.syncPrometheusMetricsOnly(serverID, metricsCfg)
+		}
+		// v2.56.0 (issue #113): apps.layer4 is independent of apps.http.servers,
+		// so a server dedicated to layer4 TCP/UDP routing with no CaddyUI-managed
+		// routes yet should still sync instead of being refused by the empty-
+		// routes guard below. (If a route-less server somehow has BOTH metrics
+		// and layer4 configured, the metrics-only branch above takes priority and
+		// layer4 is skipped this sync — an edge case of an edge case; it starts
+		// applying as soon as any proxy/redirect/raw-route/certificate exists.)
+		// v2.58.0 (issue #122): Layer4 proxy rows count too, and so does having
+		// had managed layer4 servers before — removing the LAST proxy on an
+		// otherwise empty server must still clear them from Caddy.
+		if strings.TrimSpace(srv.Layer4Caddyfile) != "" || len(layer4Proxies) > 0 || hasManagedLayer4Live(s.Caddy) {
+			return s.syncLayer4Only(serverID, srv, layer4Proxies)
 		}
 		log.Printf("caddy sync skipped: no entries in DB for server %d (refusing to push empty routes)", serverID)
 		return nil
@@ -940,7 +1149,9 @@ func (s *Server) syncCaddyInner(serverID int64, forceTLS bool) error {
 
 	accessLogCfg := loadFleetAccessLogConfig(s.DB)
 	crowdSecCfg := loadCrowdSecConfig(s.DB)
-	routes := append(s.buildMergedRoutes(proxies, redirs, raws), buildManagedCertificateRoutes(certs)...)
+	routes := append(s.buildMergedRoutes(proxies, redirs, httpsRawRoutes(raws)), buildManagedCertificateRoutes(certs, s.fallbackRoute()["handle"].([]any))...)
+	routes = sortRoutesBySpecificity(routes) // v2.61.3 (issue #129): wildcard certificate routes after exact hosts
+	routes = s.withFallbackRoute(routes)     // v2.59.4 (issue #123)
 	httpRoutes := s.buildHTTPRoutes(proxies, redirs, raws)
 	routes = protectRoutesWithCrowdSec(routes, crowdSecCfg, serverID)
 	httpRoutes = protectRoutesWithCrowdSec(httpRoutes, crowdSecCfg, serverID)
@@ -962,16 +1173,26 @@ func (s *Server) syncCaddyInner(serverID int64, forceTLS bool) error {
 		rawListenServers[name] = srv
 	}
 	loadPEM, loadFiles := buildCertLoaders(certs)
-	skipList := buildSkipCertificates(proxies, redirs, raws, certs)
+	skipList := buildSkipCertificates(proxies, redirs, httpsRawRoutes(raws), certs)
 	skipAccessLogs := buildSkipAccessLogs(proxies)
-	// v2.9.0: per-SNI TLS minimum-version connection policies. nil when no
-	// host has a min version configured — writeTLSConnectionPoliciesSubtree
-	// handles the nil case by clearing stale policies that may exist.
+	// v2.9.0: per-SNI TLS connection policies — minimum version, and since
+	// v2.64.0 client certificate authentication. nil when no host needs
+	// either; writeTLSConnectionPoliciesSubtree handles the nil case by
+	// clearing stale policies that may exist.
 	tlsConnPolicies := caddy.BuildTLSConnectionPolicies(proxies)
 	// DNS-01 issuance policies plus (v2.46.0) internal-CA issuance policies,
 	// pushed together into apps.tls.automation.
-	tlsAutomationPolicies := s.buildDNSAutomationPolicies(proxies, redirs, raws, certs)
+	tlsAutomationPolicies := s.buildDNSAutomationPolicies(proxies, redirs, httpsRawRoutes(raws), certs)
 	tlsAutomationPolicies = append(tlsAutomationPolicies, buildInternalTLSAutomationPolicies(proxies)...)
+
+	// v2.56.0 (issue #113): adapt the optional layer4 Caddyfile block through
+	// this server's own admin API before fetching/mutating its config, so a
+	// typo'd block (or a build missing caddy-l4) fails the sync up front with
+	// a clear error instead of after other subtrees have already been written.
+	layer4App, err := layer4AppFor(s.Caddy, srv, layer4Proxies)
+	if err != nil {
+		return fmt.Errorf("layer4 Caddyfile for %s: %w", srv.Name, err)
+	}
 
 	current, currentJSON, err := s.Caddy.FetchConfig()
 	if err != nil {
@@ -1007,6 +1228,8 @@ func (s *Server) syncCaddyInner(serverID int64, forceTLS bool) error {
 	applyFleetAccessLog(proposed, accessLogCfg, loadAnalyticsConfig(s.DB).Enabled, serverID)
 	applyPrometheusMetrics(proposed, metricsCfg, serverID)
 	applyCrowdSecApp(proposed, crowdSecCfg, serverID)
+	applyLayer4App(proposed, layer4App)
+	s.applyLayer4ListenerWrappers(proposed, serverID, layer4Proxies) // v2.61.0 (issue #126)
 	// v2.4.12: branded 404/502/503/504 pages with error ID + timestamp so
 	// users hitting a restart window see something nicer than Caddy's
 	// plaintext fallback and ops can correlate to access logs via {err.id}.
@@ -1015,7 +1238,7 @@ func (s *Server) syncCaddyInner(serverID int64, forceTLS bool) error {
 	// Validate before touching anything. Caddy runs full provisioning.
 	if err := s.Caddy.Validate(proposed); err != nil {
 		_ = models.LogActivity(s.DB, serverID, "system", "sync_validation_failed", "", err.Error(), false)
-		return fmt.Errorf("caddy rejected proposed config: %w", err)
+		return fmt.Errorf("caddy rejected proposed config: %s", friendlyCaddyError(err.Error()))
 	}
 
 	// Snapshot current state so we can roll back if anything goes wrong later.
@@ -1045,6 +1268,10 @@ func (s *Server) syncCaddyInner(serverID int64, forceTLS bool) error {
 	if err := s.writePrometheusMetricsConfig(proposed, metricsCfg, serverID); err != nil {
 		_ = models.LogActivity(s.DB, serverID, "system", "sync_apply_metrics_failed", "", err.Error(), false)
 		return fmt.Errorf("apply Prometheus metrics: %w", err)
+	}
+	if err := s.writeLayer4App(proposed); err != nil {
+		_ = models.LogActivity(s.DB, serverID, "system", "sync_apply_layer4_failed", "", err.Error(), false)
+		return fmt.Errorf("apply layer4 app: %w", err)
 	}
 	if err := s.writeRoutesSubtree(routes); err != nil {
 		_ = models.LogActivity(s.DB, serverID, "system", "sync_apply_routes_failed", "", err.Error(), false)
@@ -1088,6 +1315,12 @@ func (s *Server) syncCaddyInner(serverID int64, forceTLS bool) error {
 	if err := s.writeRawListenServersSubtree(rawListenServers); err != nil {
 		_ = models.LogActivity(s.DB, serverID, "system", "sync_apply_listen_servers_failed", "", err.Error(), false)
 		return err
+	}
+	// v2.61.0 (issue #126): layer4 listener wrappers go on the HTTP servers, so
+	// they are written once those servers exist.
+	if err := s.writeLayer4ListenerWrappers(serverID, layer4Proxies); err != nil {
+		_ = models.LogActivity(s.DB, serverID, "system", "sync_apply_layer4_wrappers_failed", "", err.Error(), false)
+		return fmt.Errorf("apply layer4 listener wrappers: %w", err)
 	}
 	if err := s.writeTLSConnectionPoliciesSubtree(tlsConnPolicies); err != nil {
 		// Non-fatal: log but don't abort — routes and certs are already applied.
@@ -1140,6 +1373,21 @@ func (s *Server) syncCaddyInner(serverID int64, forceTLS bool) error {
 	return nil
 }
 
+// validateForwardAuthURL rejects a forward auth URL CaddyUI cannot turn into an
+// auth subrequest (v2.59.5): it must be http:// or https:// with a host, e.g.
+// http://authentik:9000/outpost.goauthentik.io/auth/caddy. Blank = forward auth off.
+func validateForwardAuthURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return "Forward auth URL must be http:// or https:// followed by the auth service host, e.g. http://authentik:9000/outpost.goauthentik.io/auth/caddy"
+	}
+	return ""
+}
+
 // validateProxyAdvanced runs AdvancedConfig through Caddy's /adapt at save time
 // so the user gets a form error instead of a silent sync failure later. Returns
 // "" when empty or valid; otherwise a user-facing message.
@@ -1175,8 +1423,19 @@ func (s *Server) validateProxyAdvanced(caddyCl *caddy.Client, p *models.ProxyHos
 	if errMsg := validateProxyAdvancedDirectives(normalizeProxyAdvancedConfig(p.AdvancedConfig)); errMsg != "" {
 		return errMsg
 	}
-	if _, _, err := s.adaptProxyAdvancedWithClient(caddyCl, *p); err != nil {
+	handlers, _, err := s.adaptProxyAdvancedWithClient(caddyCl, *p)
+	if err != nil {
 		return friendlyAdvancedRejection(err) // v2.42.2
+	}
+	// v2.57.1: for a non-admin's request (the client carries AdaptTextCheck),
+	// inspect what the text adapted to as well — a handler nested inside a block
+	// (file_server, an upstream aimed at the admin API, ...) is invisible to the
+	// top-level directive scan above. The sync-time guard would skip such a
+	// route silently; this gives the user the reason instead.
+	if caddyCl != nil && caddyCl.AdaptTextCheck != nil {
+		if msg := s.validateTenantRoute(map[string]any{"handle": handlers}); msg != "" {
+			return msg
+		}
 	}
 	return ""
 }
@@ -1235,7 +1494,11 @@ func scanTopLevelDirective(src string, banned []string) string {
 
 func (s *Server) renderProxyHostFormError(w http.ResponseWriter, r *http.Request, p *models.ProxyHost, errMsg string) {
 	certs, _ := s.certListForRequest(r)
-	s.render(w, r, "proxy_host_form.html", s.applyDNSViewData(s.currentServerID(r), map[string]any{
+	selectedProfile, _ := strconv.ParseInt(strings.TrimSpace(r.FormValue("middleware_profile_id")), 10, 64)
+	if r.Method != http.MethodPost && p != nil {
+		selectedProfile = models.ProxyHostProfileID(s.DB, p.ID)
+	}
+	s.render(w, r, "proxy_host_form.html", s.withProfileViewData(s.applyDNSViewData(s.currentServerID(r), map[string]any{
 		"User":         s.currentUser(r),
 		"Host":         p,
 		"Certificates": certs,
@@ -1244,7 +1507,7 @@ func (s *Server) renderProxyHostFormError(w http.ResponseWriter, r *http.Request
 		"Error":        errMsg,
 		"Guided":       r.FormValue("guided") == "1",
 		"Section":      "proxy",
-	}))
+	}), selectedProfile))
 }
 
 // adaptProxyAdvanced converts a proxy host's per-host AdvancedConfig (a Caddyfile
@@ -1268,7 +1531,9 @@ func (s *Server) adaptProxyAdvancedWithClient(caddyCl *caddy.Client, p models.Pr
 	// v2.42.2: repairs applied here too, so configs saved before the
 	// repairs existed adapt on the next sync without being re-saved.
 	src := fmt.Sprintf("localhost {\n%s\n}\n", normalizeProxyAdvancedConfig(p.AdvancedConfig))
-	adapted, err := caddyCl.Adapt(src)
+	// Issue #119: `import <snippet>` must see the snippets from CADDYFILE_PATH,
+	// exactly as it does in Advanced routes.
+	adapted, err := caddyCl.Adapt(s.withAutoLoadedSnippets(src))
 	if err != nil {
 		return nil, nil, err
 	}

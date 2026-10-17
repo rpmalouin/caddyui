@@ -116,6 +116,22 @@ CREATE TABLE IF NOT EXISTS caddy_servers (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS layer4_proxies (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    server_id BIGINT NOT NULL,
+    name TEXT NOT NULL,
+    protocol VARCHAR(8) NOT NULL DEFAULT 'tcp',
+    listen_addr VARCHAR(255) NOT NULL DEFAULT '',
+    listen_port INT NOT NULL,
+    upstream_host VARCHAR(255) NOT NULL,
+    upstream_port INT NOT NULL,
+    enabled TINYINT(1) NOT NULL DEFAULT 1,
+    node_local TINYINT(1) NOT NULL DEFAULT 0,
+    notes TEXT NOT NULL,
+    created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS fleet_deployments (
     source_server_id BIGINT NOT NULL,
     resource_kind VARCHAR(32) NOT NULL,
@@ -124,6 +140,47 @@ CREATE TABLE IF NOT EXISTS fleet_deployments (
     target_resource_id BIGINT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (source_server_id, resource_kind, source_resource_id, target_server_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS middleware_profiles (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(191) NOT NULL UNIQUE,
+    description TEXT NOT NULL,
+    security_headers TINYINT(1) NOT NULL DEFAULT 0,
+    x_frame_options TEXT NOT NULL,
+    referrer_policy TEXT NOT NULL,
+    permissions_policy TEXT NOT NULL,
+    csp_header TEXT NOT NULL,
+    forward_auth_url TEXT NOT NULL,
+    forward_auth_method TEXT NOT NULL,
+    forward_auth_copy_headers TEXT NOT NULL,
+    forward_auth_headers_prefix TEXT NOT NULL,
+    forward_auth_skip_paths TEXT NOT NULL,
+    access_list TEXT NOT NULL,
+    ip_blocklist TEXT NOT NULL,
+    custom_req_headers TEXT NOT NULL,
+    custom_resp_headers TEXT NOT NULL,
+    created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS proxy_host_profiles (
+    proxy_host_id BIGINT PRIMARY KEY,
+    profile_id BIGINT NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS fleet_pending_deletions (
+    source_server_id BIGINT NOT NULL,
+    resource_kind VARCHAR(32) NOT NULL,
+    source_resource_id BIGINT NOT NULL,
+    target_server_id BIGINT NOT NULL,
+    target_resource_id BIGINT NOT NULL,
+    label TEXT NOT NULL,
+    attempts INT NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL,
+    last_attempt_at TIMESTAMP NULL DEFAULT NULL,
+    created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (source_server_id, resource_kind, source_resource_id, target_server_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

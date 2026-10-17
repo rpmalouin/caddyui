@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -805,6 +806,15 @@ func (s *Server) apiAIExecTool(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "missing required argument (domains, forward_host, forward_port)"})
 			return
 		}
+		// GHSA-5h8j-xxm3-7ggr: this path skipped the same non-admin upstream
+		// SSRF guard every other proxy-host creation path applies (see
+		// validateProxyUpstreamsForUser / upstream_guard.go), so a non-admin
+		// account could use the AI tool to point a proxy at the Caddy admin
+		// API, loopback, or link-local/metadata addresses.
+		if msg := s.validateProxyUpstreamsForUser(cu, ph); msg != "" {
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+			return
+		}
 		// Domain conflict guard — same as the form path.
 		if conflict, err := models.DomainsConflict(s.DB, sid, ph.DomainList(), 0, 0); err != nil {
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "validate domains: " + err.Error()})
@@ -1142,7 +1152,14 @@ func (s *Server) apiUpstreamHealth(w http.ResponseWriter, r *http.Request) {
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
-	client := &http.Client{Timeout: 3 * time.Second}
+	// v2.57.1: never follow redirects on the direct upstream probe. A tenant's
+	// public upstream could answer 302 -> http://127.0.0.1:2019/ or the cloud
+	// metadata address and CaddyUI would fetch it, defeating the save-time
+	// upstream guard. A redirect is a healthy answer; the target is irrelevant.
+	client := &http.Client{
+		Timeout:       3 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 
 	for i, h := range hosts {
 		results[i] = upstreamHealthResult{ID: h.ID, Domains: h.Domains}
@@ -1271,39 +1288,6 @@ func isInternalHostname(host string) bool {
 	return true
 }
 
-// forbidLinkLocalTarget rejects probe targets that resolve to a link-local
-// address (169.254.0.0/16, fe80::/10).
-//
-// Review finding #12 (2026-10-04): the upstream tester connects to a
-// caller-supplied host:port, so without this a writer account could point it at
-// the cloud-metadata address (169.254.169.254) or sweep its own link-local
-// neighbourhood. The hostname is resolved once here; a name that rebinds to a
-// link-local address between this check and the probe would still slip through,
-// which is acceptable for a diagnostic an operator triggers by hand.
-func forbidLinkLocalTarget(host string) error {
-	linkLocal := func(ip net.IP) bool {
-		return ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		if linkLocal(ip) {
-			return fmt.Errorf("refusing to probe the link-local address %s", host)
-		}
-		return nil
-	}
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		// Unresolvable from CaddyUI: let the probe itself report the DNS
-		// failure with its actionable hint rather than failing here.
-		return nil
-	}
-	for _, ip := range ips {
-		if linkLocal(ip) {
-			return fmt.Errorf("refusing to probe %s: it resolves to the link-local address %s", host, ip)
-		}
-	}
-	return nil
-}
-
 // isDNSError returns true when err is a DNS resolution failure (as opposed
 // to a connection refused / timeout / TLS error). DNS failure from the
 // caddyui container doesn't imply the backend is down — Caddy on a
@@ -1353,9 +1337,33 @@ func (s *Server) apiCaddyUpstreams(w http.ResponseWriter, r *http.Request) {
 	}
 	cl := caddy.New(srv.AdminURL, srv.AdminUsername, srv.AdminPassword)
 	upstreams, err := cl.GetUpstreamHealth(ctx)
+	cu := s.currentUser(r)
 	if err != nil {
-		_ = json.NewEncoder(w).Encode(map[string]any{"upstreams": nil, "error": err.Error()})
+		msg := err.Error()
+		if !isAdminUser(cu) {
+			msg = "could not reach Caddy" // the error text repeats the node's admin URL
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"upstreams": nil, "error": msg})
 		return
+	}
+	// v2.57.1: Caddy reports EVERY upstream on the server. A non-admin sees only
+	// the upstreams of the hosts they can see in the host list.
+	if !isAdminUser(cu) && cu != nil {
+		hosts, _ := models.ListProxyHosts(s.DB, sid, cu.ID, false, s.groupPeerIDs(r))
+		allowed := map[string]bool{}
+		for _, h := range hosts {
+			allowed[fmt.Sprintf("%s:%d", h.ForwardHost, h.ForwardPort)] = true
+			for _, extra := range h.ExtraUpstreamList() {
+				allowed[extra] = true
+			}
+		}
+		visible := upstreams[:0:0]
+		for _, u := range upstreams {
+			if allowed[u.Address] {
+				visible = append(visible, u)
+			}
+		}
+		upstreams = visible
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"upstreams": upstreams})
 }
@@ -1393,10 +1401,22 @@ func (s *Server) apiTestUpstream(w http.ResponseWriter, r *http.Request) {
 	if scheme != "https" {
 		scheme = "http"
 	}
-	if err := forbidLinkLocalTarget(host); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
-		return
+	// v2.57.1: this endpoint makes CaddyUI itself connect to host:port and
+	// reports status, latency and the error text, which makes it a port scanner
+	// for whoever can call it. Non-admins get the same upstream rules as a proxy
+	// host (no loopback / link-local / metadata / any Caddy admin API), and the
+	// host and port must be plain — they are spliced into a URL.
+	if !isAdminUser(s.currentUser(r)) {
+		if strings.ContainsAny(host, "/?#@\\ ") || strings.ContainsAny(port, "/?#@\\ ") {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "invalid host or port"})
+			return
+		}
+		if why := dialBlockedForTenant(net.JoinHostPort(host, port), s.adminHostSet()); why != "" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "Not allowed for a non-admin account: " + why})
+			return
+		}
 	}
 	targetURL := fmt.Sprintf("%s://%s:%s/", scheme, host, port)
 	client := &http.Client{
@@ -1485,7 +1505,13 @@ func (s *Server) apiValidateRawRoute(w http.ResponseWriter, r *http.Request) {
 		// to Caddy's running state.
 		_, _, err := s.adaptRawRouteCaddyfile(s.caddyForRequest(r), cfSrc)
 		if err != nil {
-			respond(false, "Caddyfile rejected by Caddy: "+err.Error())
+			// Caddy adapts a client_auth block happily; it is CaddyUI that
+			// turns it down, so don't put the words in Caddy's mouth.
+			if errors.Is(err, errClientAuthInRawRoute) {
+				respond(false, err.Error())
+			} else {
+				respond(false, "Caddyfile rejected by Caddy: "+err.Error())
+			}
 			return
 		}
 		// If Caddyfile is fine and JSON is empty (most common case), we're

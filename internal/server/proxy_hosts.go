@@ -206,6 +206,10 @@ func (s *Server) getProxyHostHealth(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if !s.canManageOwned(s.currentUser(r), host.OwnerID) { // v2.57.1: same scope as the host list
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 	checks, err := models.GetProxyHealthHistory(s.DB, id, 50)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -527,6 +531,7 @@ func (s *Server) bulkDeleteProxyHosts(w http.ResponseWriter, r *http.Request) {
 	}
 	sid := s.currentServerID(r)
 	deleted := 0
+	var notes []fleetDeletionNote // v2.59.0 (issue #120)
 	for _, raw := range ids {
 		id, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
@@ -539,17 +544,22 @@ func (s *Server) bulkDeleteProxyHosts(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
+		note := s.noteFleetDeletion(models.FleetResourceProxy, id, "")
 		if err := models.DeleteProxyHost(s.DB, id); err != nil {
 			log.Printf("bulk-delete proxy host %d: %v", id, err)
 			continue
 		}
 		deleted++
+		notes = append(notes, note)
 		_ = models.LogActivity(s.DB, sid, cu.Email, "proxy_host_delete", "id", strconv.FormatInt(id, 10), true)
 	}
 	if deleted > 0 {
-		if err := s.syncCaddy(sid, false); err != nil {
+		if err := s.syncCaddyOpts(sid, false, true); err != nil {
 			log.Printf("bulk-delete: sync error: %v", err)
 		}
+	}
+	for _, n := range notes {
+		s.propagateNotedDeletion(cu.Email, n)
 	}
 	http.Redirect(w, r, "/proxy-hosts", http.StatusSeeOther)
 }
@@ -835,6 +845,7 @@ func (s *Server) bulkDeleteRawRoutes(w http.ResponseWriter, r *http.Request) {
 	}
 	sid := s.currentServerID(r)
 	deleted := 0
+	var notes []fleetDeletionNote // v2.59.0 (issue #120)
 	for _, raw := range ids {
 		id, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
@@ -846,17 +857,22 @@ func (s *Server) bulkDeleteRawRoutes(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
+		note := s.noteFleetDeletion(models.FleetResourceRawRoute, id, "")
 		if err := models.DeleteRawRoute(s.DB, id); err != nil {
 			log.Printf("bulk-delete raw route %d: %v", id, err)
 			continue
 		}
 		deleted++
+		notes = append(notes, note)
 		_ = models.LogActivity(s.DB, sid, cu.Email, "raw_route_delete", "id", strconv.FormatInt(id, 10), true)
 	}
 	if deleted > 0 {
-		if err := s.syncCaddy(sid, false); err != nil {
+		if err := s.syncCaddyOpts(sid, false, true); err != nil {
 			log.Printf("bulk-delete raw: sync error: %v", err)
 		}
+	}
+	for _, n := range notes {
+		s.propagateNotedDeletion(cu.Email, n)
 	}
 	http.Redirect(w, r, "/raw-routes", http.StatusSeeOther)
 }
@@ -930,6 +946,7 @@ func (s *Server) bulkDeleteRedirectionHosts(w http.ResponseWriter, r *http.Reque
 	}
 	sid := s.currentServerID(r)
 	deleted := 0
+	var notes []fleetDeletionNote // v2.59.0 (issue #120)
 	for _, raw := range ids {
 		id, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
@@ -941,17 +958,22 @@ func (s *Server) bulkDeleteRedirectionHosts(w http.ResponseWriter, r *http.Reque
 				continue
 			}
 		}
+		note := s.noteFleetDeletion(models.FleetResourceRedirect, id, "")
 		if err := models.DeleteRedirectionHost(s.DB, id); err != nil {
 			log.Printf("bulk-delete redirection %d: %v", id, err)
 			continue
 		}
 		deleted++
+		notes = append(notes, note)
 		_ = models.LogActivity(s.DB, sid, cu.Email, "redirect_delete", "id", strconv.FormatInt(id, 10), true)
 	}
 	if deleted > 0 {
-		if err := s.syncCaddy(sid, false); err != nil {
+		if err := s.syncCaddyOpts(sid, false, true); err != nil {
 			log.Printf("bulk-delete redir: sync error: %v", err)
 		}
+	}
+	for _, n := range notes {
+		s.propagateNotedDeletion(cu.Email, n)
 	}
 	http.Redirect(w, r, "/redirection-hosts", http.StatusSeeOther)
 }
@@ -966,6 +988,13 @@ func (s *Server) toggleMaintenanceMode(w http.ResponseWriter, r *http.Request) {
 	ph, err := models.GetProxyHost(s.DB, id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// Security (v2.57.1): this handler flipped maintenance mode on any host by
+	// ID. Every other mutation handler (toggle, bulk, edit, delete) checks
+	// ownership; this one — and the bulk variant's single-host sibling — did not.
+	if !s.canManageOwned(s.currentUser(r), ph.OwnerID) {
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	ph.MaintenanceMode = !ph.MaintenanceMode
@@ -1342,11 +1371,60 @@ func marshalExtraUpstreams(r *http.Request) string {
 // otherManagedServers returns all managed Caddy servers except the one currently
 // selected in the request cookie. Used to populate the cross-deploy checkbox list.
 func (s *Server) otherManagedServers(r *http.Request) []models.CaddyServer {
+	current := s.currentServerID(r)
+	out := s.otherManagedServersExcept(current)
+	// v2.57.0 (issue #120): flag the selected server's persistent default
+	// deploy targets so every resource form can show them as always-on.
+	if src, err := models.GetCaddyServer(s.DB, current); err == nil {
+		defaults := src.DefaultDeployTargetSet()
+		for i := range out {
+			out[i].IsDefaultDeployTarget = defaults[out[i].ID]
+		}
+	}
+	return out
+}
+
+// effectiveDeployTargets is the set of servers a web-UI save on sourceServerID
+// mirrors to: the form's one-off "Also deploy to" picks plus the source
+// server's persistent DefaultDeployTargets (v2.57.0, issue #120), so a fleet
+// whose edge nodes are always fed from one source Caddy never has to re-tick
+// the same boxes on every create and edit. A server is never its own target,
+// and each target appears once.
+//
+// Node-local resources are still never deployed — the cross-deploy functions
+// refuse them — so marking a resource node-local is how one opts a single
+// resource out of the defaults.
+func (s *Server) effectiveDeployTargets(sourceServerID int64, formTargets []int64) []int64 {
+	out := make([]int64, 0, len(formTargets))
+	seen := map[int64]bool{sourceServerID: true}
+	add := func(ids []int64) {
+		for _, id := range ids {
+			if id > 0 && !seen[id] {
+				seen[id] = true
+				out = append(out, id)
+			}
+		}
+	}
+	add(formTargets)
+	if src, err := models.GetCaddyServer(s.DB, sourceServerID); err == nil {
+		add(src.DefaultDeployTargetIDs())
+	}
+	return out
+}
+
+// otherManagedServersExcept returns all managed Caddy servers except excludeID.
+// v2.56.0 (issue #113): the Caddy server form's layer4 fleet-replication
+// picker needs this directly rather than through otherManagedServers — unlike
+// a proxy/redirect/raw-route, which always belongs to the currently-selected
+// server cookie, a CaddyServer row being edited can be ANY server regardless
+// of which one is currently selected, so excluding the cookie's server would
+// be wrong (it could list the server being edited as its own deploy target,
+// or wrongly hide an unrelated one).
+func (s *Server) otherManagedServersExcept(excludeID int64) []models.CaddyServer {
 	all, _ := models.ListCaddyServers(s.DB)
-	cur := s.currentServerID(r)
 	var out []models.CaddyServer
 	for _, srv := range all {
-		if srv.ID != cur && srv.Type == models.CaddyServerTypeManaged {
+		if srv.ID != excludeID && srv.Type == models.CaddyServerTypeManaged {
 			out = append(out, srv)
 		}
 	}
@@ -1789,7 +1867,7 @@ func (s *Server) newProxyHost(w http.ResponseWriter, r *http.Request) {
 	// operators can opt into the full several-hundred-field editor explicitly;
 	// edit routes remain advanced so existing configuration is never hidden.
 	guided := r.URL.Query().Get("mode") != "advanced"
-	s.render(w, r, "proxy_host_form.html", s.applyDNSViewData(s.currentServerID(r), map[string]any{
+	s.render(w, r, "proxy_host_form.html", s.withProfileViewData(s.applyDNSViewData(s.currentServerID(r), map[string]any{
 		"User":         s.currentUser(r),
 		"Host":         &models.ProxyHost{Enabled: true, SSLEnabled: true, SSLForced: true, HTTP2Support: true, ForwardScheme: "http"},
 		"Certificates": certs,
@@ -1797,7 +1875,7 @@ func (s *Server) newProxyHost(w http.ResponseWriter, r *http.Request) {
 		"OtherServers": s.otherManagedServers(r),
 		"Guided":       guided,
 		"Section":      "proxy",
-	}))
+	}), 0))
 }
 
 func (s *Server) createProxyHost(w http.ResponseWriter, r *http.Request) {
@@ -1810,6 +1888,16 @@ func (s *Server) createProxyHost(w http.ResponseWriter, r *http.Request) {
 	if errMsg := validateSSLFlags(p.SSLEnabled, p.SSLForced, p.CertificateID); errMsg != "" {
 		s.renderProxyHostFormError(w, r, p, errMsg)
 		return
+	}
+	if errMsg := validateForwardAuthURL(p.ForwardAuthURL); errMsg != "" { // v2.59.5 (issues #124/#125)
+		s.renderProxyHostFormError(w, r, p, errMsg)
+		return
+	}
+	if pid := s.hostProfileFromForm(r); pid != 0 && s.profileWAFOn(pid) { // v2.61.0: WAF needs the Coraza module
+		if errMsg := s.wafPreflight([]int64{s.currentServerID(r)}); errMsg != "" {
+			s.renderProxyHostFormError(w, r, p, errMsg)
+			return
+		}
 	}
 	if errMsg := s.validateProxyAdvanced(s.caddyForRequest(r), p); errMsg != "" {
 		s.renderProxyHostFormError(w, r, p, errMsg)
@@ -1859,7 +1947,7 @@ func (s *Server) createProxyHost(w http.ResponseWriter, r *http.Request) {
 	}
 	// Parse extra upstreams (Feature D).
 	p.ExtraUpstreams = marshalExtraUpstreams(r)
-	deployTo := parseDeployTo(r)
+	deployTo := s.effectiveDeployTargets(s.currentServerID(r), parseDeployTo(r))
 	cu := s.currentUser(r)
 	// SSRF guard (GHSA-r4wm-rgc5-q834): block non-admins from pointing the
 	// upstream (host, extra upstreams, or Host override) at loopback/link-local/
@@ -1895,6 +1983,7 @@ func (s *Server) createProxyHost(w http.ResponseWriter, r *http.Request) {
 	}
 	p.ID = id
 	p.ServerID = s.currentServerID(r)
+	_ = models.SetProxyHostProfile(s.DB, id, s.hostProfileFromForm(r)) // v2.60.0 (issue #124)
 	if err := models.UpdateProxyHostDNSProfile(s.DB, id, p.DNSProfileID); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1955,14 +2044,14 @@ func (s *Server) editProxyHost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	certs, _ := s.certListForRequest(r)
-	s.render(w, r, "proxy_host_form.html", s.applyDNSViewData(s.currentServerID(r), map[string]any{
+	s.render(w, r, "proxy_host_form.html", s.withProfileViewData(s.applyDNSViewData(s.currentServerID(r), map[string]any{
 		"User":         s.currentUser(r),
 		"Host":         p,
 		"Certificates": certs,
 		"Users":        s.adminUserList(r),
 		"OtherServers": s.otherManagedServers(r),
 		"Section":      "proxy",
-	}))
+	}), models.ProxyHostProfileID(s.DB, p.ID)))
 }
 
 func (s *Server) updateProxyHost(w http.ResponseWriter, r *http.Request) {
@@ -1987,6 +2076,16 @@ func (s *Server) updateProxyHost(w http.ResponseWriter, r *http.Request) {
 	if errMsg := validateSSLFlags(p.SSLEnabled, p.SSLForced, p.CertificateID); errMsg != "" {
 		s.renderProxyHostFormError(w, r, p, errMsg)
 		return
+	}
+	if errMsg := validateForwardAuthURL(p.ForwardAuthURL); errMsg != "" { // v2.59.5 (issues #124/#125)
+		s.renderProxyHostFormError(w, r, p, errMsg)
+		return
+	}
+	if pid := s.hostProfileFromForm(r); pid != 0 && s.profileWAFOn(pid) { // v2.61.0: WAF needs the Coraza module
+		if errMsg := s.wafPreflight([]int64{s.currentServerID(r)}); errMsg != "" {
+			s.renderProxyHostFormError(w, r, p, errMsg)
+			return
+		}
 	}
 	if errMsg := s.validateProxyAdvanced(s.caddyForRequest(r), p); errMsg != "" {
 		s.renderProxyHostFormError(w, r, p, errMsg)
@@ -2036,7 +2135,7 @@ func (s *Server) updateProxyHost(w http.ResponseWriter, r *http.Request) {
 		s.renderProxyHostFormError(w, r, p, msg)
 		return
 	}
-	deployTo := parseDeployTo(r)
+	deployTo := s.effectiveDeployTargets(s.currentServerID(r), parseDeployTo(r))
 	old, _ := models.GetProxyHost(s.DB, id)
 
 	// Unified DNS lifecycle. A record needs replacing when:
@@ -2083,6 +2182,7 @@ func (s *Server) updateProxyHost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	_ = models.SetProxyHostProfile(s.DB, p.ID, s.hostProfileFromForm(r)) // v2.60.0 (issue #124)
 	if err := models.UpdateProxyHostDNSProfile(s.DB, p.ID, p.DNSProfileID); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -2142,6 +2242,10 @@ func (s *Server) deleteProxyHost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	note := s.noteFleetDeletion(models.FleetResourceProxy, id, "")
+	if old != nil {
+		note.label = old.Domains
+	}
 	// Unified DNS: delete any managed record before removing the host.
 	// No-op when the host has no DNS-managed record.
 	if old != nil && old.DNSRecordID != "" {
@@ -2153,7 +2257,8 @@ func (s *Server) deleteProxyHost(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = models.LogActivity(s.DB, s.currentServerID(r), s.currentUserEmail(r), "proxy_delete", fmt.Sprintf("proxy:%d", id), "", true)
 	forceTLS := old != nil && old.CertificateID != 0
-	s.trySyncCaddy(s.currentServerID(r), forceTLS)
+	s.trySyncCaddyAfterDelete(s.currentServerID(r), forceTLS)
+	s.propagateNotedDeletion(s.currentUserEmail(r), note) // v2.59.0 (issue #120)
 	if old != nil {
 		payload, _ := json.Marshal(map[string]any{
 			"event":   "proxy_host_deleted",
@@ -2176,6 +2281,14 @@ func (s *Server) cloneProxyHost(w http.ResponseWriter, r *http.Request) {
 	src, err := models.GetProxyHost(s.DB, id)
 	if err != nil || src == nil {
 		http.NotFound(w, r)
+		return
+	}
+	// Clone was missing the ownership check every other access to this
+	// resource enforces, so a non-admin could clone (and thereby read the
+	// full configuration of, including upstream and advanced config) any
+	// other tenant's or the admin's proxy host by guessing its ID.
+	if !s.canManageOwned(s.currentUser(r), src.OwnerID) {
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	// Build cloned domain list — append "(copy)" to each domain.
@@ -2203,5 +2316,6 @@ func (s *Server) cloneProxyHost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = models.UpdateProxyHostDNSProfile(s.DB, newID, clone.DNSProfileID)
+	_ = models.SetProxyHostProfile(s.DB, newID, models.ProxyHostProfileID(s.DB, src.ID)) // v2.60.0 (issue #124)
 	http.Redirect(w, r, fmt.Sprintf("/proxy-hosts/%d/edit", newID), http.StatusSeeOther)
 }

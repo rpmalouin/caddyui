@@ -209,6 +209,24 @@ func (s *Server) listCertificates(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// dismissTOTPPolicyRecommendation acknowledges the dashboard's "two-factor
+// authentication is not required" recommendation. v2.64.2 (issue #138):
+// choosing not to require site-wide TOTP is legitimate, and the dashboard
+// should be able to reach a clean state once that choice is recorded.
+func (s *Server) dismissTOTPPolicyRecommendation(w http.ResponseWriter, r *http.Request) {
+	cu := s.currentUser(r)
+	if cu == nil || !cu.IsAdmin {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if err := models.SetSetting(s.DB, settingTOTPPolicyDismissed, "1"); err != nil {
+		http.Error(w, "save dismissal: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_ = models.LogActivity(s.DB, s.currentServerID(r), cu.Email, "recommendation_dismiss", "two_factor_policy", "", true)
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 func (s *Server) dismissUnusedCertificateRecommendation(w http.ResponseWriter, r *http.Request) {
 	sid := s.currentServerID(r)
 	certs, err := models.ListCertificates(s.DB, sid)
@@ -242,8 +260,11 @@ func (s *Server) getCertificateInspect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid id", http.StatusBadRequest)
 		return
 	}
-	cert, err := models.GetCertificate(s.DB, id)
-	if err != nil {
+	// v2.57.1: only certificates the current user may see in the list. This
+	// handler loaded the row by ID alone, so any account could read another
+	// tenant's certificate name, domains and file paths.
+	cert, err := s.visibleCertificate(r, id)
+	if err != nil || cert == nil {
 		http.NotFound(w, r)
 		return
 	}
@@ -534,6 +555,19 @@ func (s *Server) parseCertificateForm(r *http.Request) (*models.Certificate, str
 			return nil, "Certificate path and Key path are required when source is 'path'"
 		}
 	} else {
+		// Security (v2.57.1): export writes the certificate and its private key
+		// to a directory of the requester's choosing, and source push makes
+		// CaddyUI read a domain's key out of Caddy's storage and copy it to
+		// other servers. Both act with CaddyUI's authority over the host, not
+		// the requester's own resources, so they are admin-only.
+		if !isAdminUser(s.currentUser(r)) {
+			if strings.TrimSpace(r.FormValue("export_dir")) != "" {
+				return nil, "Exporting a certificate to a directory is admin-only"
+			}
+			if r.FormValue("fleet_distribution_mode") == models.CertFleetDistributionSourcePush {
+				return nil, "Pushing a certificate to other servers is admin-only"
+			}
+		}
 		c.DNSProvider, c.DNSProfileID = s.normalizeDNSFormSelection(
 			r.FormValue("dns_provider"), r.FormValue("dns_profile_id"))
 		if c.DNSProvider == "" {
@@ -557,8 +591,40 @@ func (s *Server) parseCertificateForm(r *http.Request) (*models.Certificate, str
 			}
 		}
 		c.Export = exportJSON
+		// v2.55.0 (issue #115): opt-in "source push" fleet distribution. A
+		// checkbox submits its value only when checked, so anything other
+		// than the expected value (including absent) means "off" — the
+		// original, default behavior. Only a Managed ACME certificate can
+		// carry this; PEM/path certificates never reach this branch, so
+		// FleetDistributionMode/FleetPushTargets stay at their zero value for
+		// every other certificate, exactly like today.
+		if r.FormValue("fleet_distribution_mode") == models.CertFleetDistributionSourcePush {
+			c.FleetDistributionMode = models.CertFleetDistributionSourcePush
+			c.FleetPushTargets = joinFleetPushTargets(parseDeployTo(r))
+		}
 	}
 	return c, ""
+}
+
+// certificateDeployTargets is the "Also configure on" selection for a
+// certificate. Copying a certificate definition to other servers acts with the
+// admin's DNS credentials and creates global rows there, so a non-admin's
+// selection is ignored (v2.57.1).
+func (s *Server) certificateDeployTargets(r *http.Request) []int64 {
+	if !isAdminUser(s.currentUser(r)) {
+		return nil
+	}
+	return parseDeployTo(r)
+}
+
+// joinFleetPushTargets formats target CaddyServer IDs as the comma-separated
+// string Certificate.FleetPushTargets/FleetPushTargetIDs expect.
+func joinFleetPushTargets(ids []int64) string {
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = strconv.FormatInt(id, 10)
+	}
+	return strings.Join(parts, ",")
 }
 
 func (s *Server) createCertificate(w http.ResponseWriter, r *http.Request) {
@@ -575,6 +641,12 @@ func (s *Server) createCertificate(w http.ResponseWriter, r *http.Request) {
 			KeyPath:      r.FormValue("key_path"),
 			DNSProvider:  r.FormValue("dns_provider"),
 			DNSProfileID: r.FormValue("dns_profile_id"),
+		}
+		// v2.55.0 (issue #115): don't lose the fleet-push toggle/picker
+		// selections just because some other field failed validation.
+		if r.FormValue("fleet_distribution_mode") == models.CertFleetDistributionSourcePush {
+			fallback.FleetDistributionMode = models.CertFleetDistributionSourcePush
+			fallback.FleetPushTargets = joinFleetPushTargets(parseDeployTo(r))
 		}
 		data := map[string]any{
 			"User":         s.currentUser(r),
@@ -621,7 +693,7 @@ func (s *Server) createCertificate(w http.ResponseWriter, r *http.Request) {
 	s.trySyncCaddy(s.currentServerID(r), true)
 	s.probeCertificateSoon(s.currentServerID(r), *c)
 	s.exportCertificateSoon(s.currentServerID(r), *c)
-	s.crossDeployCertificate(s.currentUserEmail(r), s.currentServerID(r), *c, parseDeployTo(r))
+	s.crossDeployCertificate(s.currentUserEmail(r), s.currentServerID(r), *c, s.certificateDeployTargets(r))
 	http.Redirect(w, r, "/certificates", http.StatusSeeOther)
 }
 
@@ -687,6 +759,15 @@ func (s *Server) updateCertificate(w http.ResponseWriter, r *http.Request) {
 		existing.KeyPath = r.FormValue("key_path")
 		existing.DNSProvider = r.FormValue("dns_provider")
 		existing.DNSProfileID = r.FormValue("dns_profile_id")
+		// v2.55.0 (issue #115): don't lose the fleet-push toggle/picker
+		// selections just because some other field failed validation.
+		if r.FormValue("fleet_distribution_mode") == models.CertFleetDistributionSourcePush {
+			existing.FleetDistributionMode = models.CertFleetDistributionSourcePush
+			existing.FleetPushTargets = joinFleetPushTargets(parseDeployTo(r))
+		} else {
+			existing.FleetDistributionMode = ""
+			existing.FleetPushTargets = ""
+		}
 		data := map[string]any{
 			"User":         s.currentUser(r),
 			"Cert":         existing,
@@ -724,7 +805,7 @@ func (s *Server) updateCertificate(w http.ResponseWriter, r *http.Request) {
 	s.trySyncCaddy(s.currentServerID(r), true)
 	s.probeCertificateSoon(s.currentServerID(r), *c)
 	s.exportCertificateSoon(s.currentServerID(r), *c)
-	s.crossDeployCertificate(s.currentUserEmail(r), s.currentServerID(r), *c, parseDeployTo(r))
+	s.crossDeployCertificate(s.currentUserEmail(r), s.currentServerID(r), *c, s.certificateDeployTargets(r))
 	http.Redirect(w, r, "/certificates", http.StatusSeeOther)
 }
 
