@@ -303,9 +303,25 @@ func (s *Server) postCaddyfileSave(w http.ResponseWriter, r *http.Request) {
 	// The model is the last writer: srv0 goes back to the rows' shape and route
 	// set, and the reload's Caddyfile-shaped srv0 never outlives this request.
 	syncErr := s.syncCaddy(s.currentServerID(r), false)
+
+	// A /load from the Caddyfile replaces the WHOLE document, including the
+	// top-level `logging` block CaddyUI installs for its own access and
+	// certificate streams. Startup reconciles those; a save must too, or the
+	// first save silently stops both telemetry feeds until the next restart.
+	var loggerErrs []string
+	if err := s.ReconcileAnalyticsAccessLogs(); err != nil {
+		loggerErrs = append(loggerErrs, "access logger: "+err.Error())
+	}
+	if err := s.ReconcileCertificateLogs(); err != nil {
+		loggerErrs = append(loggerErrs, "certificate logger: "+err.Error())
+	}
+
 	detail := fmt.Sprintf("reloaded %s (%d lines, %d bytes); snapshot %s", s.CaddyfilePath, strings.Count(normalized, "\n")+1, len(normalized), filepath.Base(snap))
 	if syncErr != nil {
 		detail += "; follow-up model sync failed: " + syncErr.Error()
+	}
+	if len(loggerErrs) > 0 {
+		detail += "; logger reconcile: " + strings.Join(loggerErrs, "; ")
 	}
 	_ = models.LogActivity(s.DB, s.currentServerID(r), s.currentUserEmail(r), "caddyfile_save", s.CaddyfilePath, detail, syncErr == nil)
 
@@ -317,8 +333,10 @@ func (s *Server) postCaddyfileSave(w http.ResponseWriter, r *http.Request) {
 	case syncErr != nil:
 		page.SaveOK = "Saved and reloaded. The follow-up model sync failed, so srv0 may still be in the Caddyfile's shape until the next sync: " + syncErr.Error()
 	default:
-		if willPush, why := s.modelWillPush(s.currentServerID(r)); willPush {
-			page.SaveOK = "Saved, reloaded, and the model re-asserted srv0 (proxy-host rows are the last writer)."
+		if len(loggerErrs) > 0 {
+			page.SaveOK = "Saved and reloaded, but the logging reconciliation failed (" + strings.Join(loggerErrs, "; ") + "). Access and certificate telemetry stay off until it succeeds."
+		} else if willPush, why := s.modelWillPush(s.currentServerID(r)); willPush {
+			page.SaveOK = "Saved, reloaded, the model re-asserted srv0 (proxy-host rows are the last writer), and the access + certificate loggers were reinstalled."
 		} else {
 			page.SaveOK = "Saved and reloaded. The model did NOT re-assert srv0 (" + why + "), so the live config keeps the Caddyfile's shape — the :443 routes it carries are the ones this file just loaded."
 		}

@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/X4Applegate/caddyui/internal/caddy"
+	"github.com/X4Applegate/caddyui/internal/caddylogs"
 	appdb "github.com/X4Applegate/caddyui/internal/db"
 	"github.com/X4Applegate/caddyui/internal/models"
 )
@@ -98,14 +99,15 @@ func TestCaddyfileGuardAllowsTheFilesOwnTerritory(t *testing.T) {
 // --- the save path (handler) -------------------------------------------------
 
 type saveFixture struct {
-	t          *testing.T
-	dir        string
-	path       string
-	server     *Server
-	mu         sync.Mutex
-	loads      []string
-	adaptFails bool
-	loadFails  bool
+	t              *testing.T
+	dir            string
+	path           string
+	server         *Server
+	mu             sync.Mutex
+	loads          []string
+	loggerInstalls []string
+	adaptFails     bool
+	loadFails      bool
 }
 
 // newSaveFixture wires a Server against a fake admin API that records every
@@ -141,6 +143,11 @@ func newSaveFixture(t *testing.T, file string) *saveFixture {
 				srv0["routes"].([]any)[1].(map[string]any)["handle"].([]any)[0].(map[string]any)["upstreams"].([]any)[0].(map[string]any)["dial"] = "10.1.10.10:9999"
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"result": res})
+		case strings.HasPrefix(r.URL.Path, "/config/logging"):
+			f.mu.Lock()
+			f.loggerInstalls = append(f.loggerInstalls, r.URL.Path)
+			f.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
 		case r.URL.Path == "/load" && r.Method == http.MethodPost:
 			body, _ := io.ReadAll(r.Body)
 			f.mu.Lock()
@@ -158,9 +165,22 @@ func newSaveFixture(t *testing.T, file string) *saveFixture {
 	t.Cleanup(srv.Close)
 	s, cleanup := caddyfileTestServer(t, caddy.New(srv.URL, "", ""), path)
 	t.Cleanup(cleanup)
+	// A managed server record pointed at the fake, plus a log hub, so the
+	// post-save logger reconciliation has something to install against — the same
+	// shape production has.
+	if _, err := models.CreateCaddyServer(s.DB, &models.CaddyServer{Name: "Production", AdminURL: srv.URL, Type: "managed"}); err != nil {
+		t.Fatal(err)
+	}
+	s.SetCaddyLogHub(caddylogs.New(s.DB))
 	f.server = s
 	t.Setenv(caddyfileSnapshotEnv, filepath.Join(dir, "snapshots"))
 	return f
+}
+
+func (f *saveFixture) loggerInstallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.loggerInstalls)
 }
 
 func (f *saveFixture) loadCount() int {
@@ -269,6 +289,11 @@ func TestCaddyfileSaveWritesReloadsAndKeepsTheInode(t *testing.T) {
 	}
 	if f.loadCount() != 1 {
 		t.Fatalf("expected exactly one reload, got %d", f.loadCount())
+	}
+	// A /load wipes the top-level logging block, so the save must reinstall the
+	// app's own access/certificate loggers in the same request.
+	if f.loggerInstallCount() == 0 {
+		t.Fatal("the save did not reconcile the app's loggers after the reload")
 	}
 	if !strings.Contains(f.lastLoad(), "tunnel.malouin.com") {
 		t.Fatal("the reload body is not the submitted Caddyfile")
