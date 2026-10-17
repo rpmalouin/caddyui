@@ -77,12 +77,24 @@
 {{end}}
 
 {{if .Warnings}}
-<div class="bg-amber-50 border border-amber-200 rounded-xl px-5 py-3 mb-5 max-w-5xl">
+<div class="bg-amber-50 border border-amber-200 rounded-xl px-5 py-3 mb-3 max-w-5xl">
   <div class="font-medium text-sm text-amber-900">Adapter warnings</div>
   <ul class="text-xs mt-1 text-amber-800 list-disc list-inside space-y-0.5">
     {{range .Warnings}}<li>{{.}}</li>{{end}}
   </ul>
 </div>
+{{end}}
+
+{{if .Cosmetic}}
+<details class="bg-ink-50/50 border border-ink-200 rounded-xl px-5 py-2 mb-5 max-w-5xl">
+  <summary class="text-xs text-ink-600 cursor-pointer select-none">
+    {{len .Cosmetic}} cosmetic adapter warning{{if ne (len .Cosmetic) 1}}s{{end}} — formatting only, nothing changes what the file serves
+  </summary>
+  <ul class="text-xs mt-2 text-ink-500 list-disc list-inside space-y-0.5 font-mono">
+    {{range .Cosmetic}}<li>{{.}}</li>{{end}}
+    <li>Running <code>caddy fmt --overwrite</code> would rewrite the whole file (line endings and indentation).</li>
+  </ul>
+</details>
 {{end}}
 
 {{if .DriftOK}}

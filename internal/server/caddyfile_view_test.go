@@ -427,3 +427,68 @@ func TestCaddyfileCommentOnlyBlocksAreNotSites(t *testing.T) {
 		t.Fatalf("kind = %q, want https", blocks[0].Kind)
 	}
 }
+
+func TestCaddyfileViewCollapsesCosmeticWarnings(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "Caddyfile")
+	if err := os.WriteFile(path, []byte("paperless.home {\r\n\treverse_proxy 10.1.10.10:8000\r\n}\r\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	admin, paths := caddyfileFakeAdmin(t, caddyfileTestConfig("10.1.10.10:8000"), caddyfileTestConfig("10.1.10.10:8000"), 200)
+	s, cleanup := caddyfileTestServer(t, admin, path)
+	defer cleanup()
+
+	rec := httptest.NewRecorder()
+	s.getCaddyfileView(rec, httptest.NewRequest(http.MethodGet, "/caddyfile", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, "cosmetic adapter warning") {
+		t.Fatalf("the formatting notice is not reported at all")
+	}
+	if strings.Contains(body, ">Adapter warnings<") {
+		t.Fatalf("a formatting-only warning must not render as a warning card")
+	}
+	if !strings.Contains(body, "formatting only, nothing changes what the file serves") {
+		t.Fatalf("the collapsed summary wording is missing")
+	}
+	if !strings.Contains(body, "caddy fmt --overwrite") {
+		t.Fatalf("the collapsed detail does not explain what would rewrite the file")
+	}
+	assertNoConfigWrite(t, paths())
+}
+
+func TestCaddyfileViewKeepsSubstantiveWarningsVisible(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "Caddyfile")
+	if err := os.WriteFile(path, []byte("paperless.home {\r\n\treverse_proxy 10.1.10.10:8000\r\n}\r\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/config/":
+			_ = json.NewEncoder(w).Encode(caddyfileTestConfig("10.1.10.10:8000"))
+		case "/adapt":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"result": caddyfileTestConfig("10.1.10.10:8000"),
+				"warnings": []any{
+					map[string]any{"file": "Caddyfile", "line": 1.0, "message": "the 'tls' directive is deprecated"},
+					map[string]any{"file": "Caddyfile", "line": 7.0, "message": "Caddyfile input is not formatted; run 'caddy fmt --overwrite' to fix inconsistencies"},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer srv.Close()
+	s, cleanup := caddyfileTestServer(t, caddy.New(srv.URL, "", ""), path)
+	defer cleanup()
+
+	rec := httptest.NewRecorder()
+	s.getCaddyfileView(rec, httptest.NewRequest(http.MethodGet, "/caddyfile", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, ">Adapter warnings<") || !strings.Contains(body, "deprecated") {
+		t.Fatalf("a substantive warning must stay in the open warning card")
+	}
+	if !strings.Contains(body, "cosmetic adapter warning") {
+		t.Fatalf("the formatting notice should still be summarised alongside it")
+	}
+}

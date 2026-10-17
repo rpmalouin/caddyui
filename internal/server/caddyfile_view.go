@@ -60,12 +60,12 @@ type caddyfilePage struct {
 	AdaptErr  string
 	AdminErr  string
 	Warnings  []string
+	Cosmetic  []string
 	LiveErr   string
 	Live      []serverIndex
 	Drift     []serverDrift
 	DriftOK   bool
 	Blocks    []caddyfileBlock
-	NotFormat bool
 	ServerID  int64
 	ServerNm  string
 	ServerTyp string
@@ -397,8 +397,12 @@ func isCaddyfileAdapterError(msg string) bool {
 	return strings.Contains(msg, "adapting config using caddyfile adapter")
 }
 
-func adaptWarnings(warnings []map[string]any) []string {
-	var out []string
+// adaptWarnings splits the adapter's warnings into ones that change how the
+// file is read and cosmetic formatting notices. Only the first kind deserves an
+// alarm: "not formatted" says nothing about what the file serves (a formatted
+// copy adapts to a byte-identical config), so it is reduced to one collapsed
+// line instead of a warning card on every visit.
+func adaptWarnings(warnings []map[string]any) (substantive, cosmetic []string) {
 	for _, w := range warnings {
 		msg, _ := w["message"].(string)
 		file, _ := w["file"].(string)
@@ -409,12 +413,13 @@ func adaptWarnings(warnings []map[string]any) []string {
 		if msg == "" {
 			continue
 		}
-		out = append(out, line+msg)
 		if strings.Contains(msg, "not formatted") {
-			out[len(out)-1] += " (cosmetic: `caddy fmt` would rewrite the whole file)"
+			cosmetic = append(cosmetic, line+msg)
+			continue
 		}
+		substantive = append(substantive, line+msg)
 	}
-	return out
+	return substantive, cosmetic
 }
 
 // getCaddyfileView renders the mounted Caddyfile read-only, adapted, and
@@ -511,16 +516,11 @@ func (s *Server) renderCaddyfilePage(w http.ResponseWriter, r *http.Request, pag
 			page.AdaptErr = "Caddy returned an empty adapt result"
 		default:
 			page.Adapted = true
-			page.Warnings = adaptWarnings(res.Warnings)
+			page.Warnings, page.Cosmetic = adaptWarnings(res.Warnings)
 			fileIdx := indexConfig(res.Result)
 			if liveErr == nil && liveCfg != nil {
 				page.Drift = driftBetween(fileIdx, liveIdx)
 				page.DriftOK = true
-			}
-			for _, w := range page.Warnings {
-				if strings.Contains(w, "not formatted") {
-					page.NotFormat = true
-				}
 			}
 			page.Blocks = s.classifyCaddyfileBlocks(r, content, fileIdx, liveIdx)
 		}
