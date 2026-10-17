@@ -81,6 +81,94 @@ internal/server/frontdoor_probe_test.go          new — address discovery, Host
 The same gap exists in upstream (`X4Applegate/caddyui`) — its `checkProxyHost`
 has no DNS branch either — but this fork carries local work only.
 
+## Fork delta: reading and editing the Caddyfile (`/caddyfile`)
+
+The app in `managed` mode owns `srv0`: it rebuilds the `:443` route set from the `proxy_hosts`
+rows on every start and save. The Caddyfile on disk is therefore read only at boot or by a
+by-hand `caddy reload`, nothing reconciles it against the model, and it drifts silently — on
+2026-10-17 it had lost two live site blocks and was still dialling two TLS upstreams over plain
+HTTP, so the reload that looked like a no-op would have been a regression. Upstream has no view
+of that file at all; this fork adds one, and gives it a scoped write path.
+
+### Stage 1 — read-only view, validation and drift (commits `309a137`, `5b5abe0`)
+
+`GET /caddyfile` (admin) shows the file at `CADDYFILE_PATH` with its line count, bytes, sha256 and
+line endings, adapts it through Caddy's **`/adapt`** (which runs no configuration), and compares
+the result against the live `/config/` **per host**: host set, upstream dials, basicauth accounts
+(sha256-prefixed, never the value) and `header_up` sets. Every top-level block is labelled by who
+owns it — `model (enabled)`, `model row DISABLED` (a reload would resurrect it), `not in the
+model` (the next sync drops it), `Caddyfile (:80)`, snippet, global options.
+
+`POST /caddyfile/validate` adapts the textarea's buffer, so an edit can be checked before it
+exists anywhere. Formatting-only adapter warnings are collapsed into one line; anything that
+changes how the file is read stays an open warning.
+
+### Stage 2 — a save path scoped to what the file owns (commits `f2979b6`, `2714586`)
+
+`POST /caddyfile/save` (admin, CSRF from the rendered form) writes the file, and the scope is
+enforced by a guard rather than trusted:
+
+| Step | What it does |
+|---|---|
+| stale check | the page carries the file's sha256 as `base_sha`; a mismatch refuses the save, so a stale tab cannot clobber a concurrent edit |
+| adapt | the buffer goes to `/adapt`; adapter rejections and admin-API refusals are reported separately (a wiring failure must not read as a bad file) |
+| ownership guard | adapts the file on disk too and refuses when any `:443` listener's host set or per-host signature moves, or when `apps.http.automatic_https` / `apps.tls` changes — those are rebuilt from the rows |
+| snapshot | one timestamped copy per save, `CADDYUI_CADDYFILE_SNAPSHOT_DIR` (default `/data/caddyfile-snapshots`) |
+| write | in place (`O_TRUNC`, same inode — a rename would move it out from under Caddy's own bind), line endings normalised to the file's existing style |
+| reload | `POST /load` as `text/caddyfile`, i.e. this **applies** the file |
+| re-sync | a managed sync follows immediately, so the rows are the last writer and the Caddyfile-shaped `srv0` does not outlive the request |
+| loggers | `ReconcileAnalyticsAccessLogs` + `ReconcileCertificateLogs` run after the sync (see below) |
+| record | `activity_log` row `caddyfile_save` with lines, bytes, snapshot name and any failure |
+
+A rejected reload restores the file from the snapshot and says so. A refused snapshot or write
+never reaches Caddy. The success message is derived from whether the model will actually push —
+`syncCaddy` returns nil for a *skip* as well as for a write, so a skip reads as "the model did
+NOT re-assert srv0 (reason)", never as a write that did not happen.
+
+**Two traps this delta encodes, both measured here:**
+
+- **Caddy has no `validate_only`.** The query parameter is silently ignored and `/load` applies
+  whatever it accepts, for `application/json` and `text/caddyfile` alike. A probe aiming at a dry
+  run took the front door down on 2026-10-17. Validation that runs nothing is `/adapt`; `/load` is
+  the deploy button.
+- **A `/load` from a Caddyfile replaces the whole document**, including the top-level `logging`
+  block CaddyUI installs for its own access ingest and certificate lifecycle streams. The first
+  real save dropped `caddyui_access` / `caddyui_certificate_events` / `caddyui_certificates` and
+  every server's `logs` key, silently stopping both telemetry feeds until the next restart. The
+  save path now reconciles them itself; any other raw `/load` from a Caddyfile owes the same.
+
+Deployment requirements this delta implies: the Caddyfile mount must be writable, and the file must
+be writable by the app's UID — the container runs as `10001`, and a `root:root 0644` file fails
+every save (`root:10001 0664` is the working shape). The admin API is reached through the fork's
+`CADDYUI_ADMIN_HOST_HEADER` patch, unchanged.
+
+```
+internal/server/caddyfile_view.go          new — read-only page, /adapt, per-host drift, block ownership
+internal/server/caddyfile_write.go         new — save path, guard, snapshot, in-place write, logger reconcile
+internal/server/caddyfile_view_test.go     new — index/signature/drift, no-config-write invariant, warnings
+internal/server/caddyfile_save_test.go     new — guard refusals, stale/unconfirmed/unadaptable, inode+CRLF, rollback
+internal/server/server.go                  routes: GET /caddyfile, POST /caddyfile/validate, POST /caddyfile/save
+internal/caddy/client.go                   Adapt (already present) + LoadCaddyfile (the applying call)
+web/templates/caddyfile_view.html          the page: meta, drift, ownership, editor + confirm
+web/templates/layout.html, web/i18n/*      nav entry `nav.caddyfile` (en + zh-CN)
+```
+
+Verified: `gofmt` empty, `go build`/`go vet` clean, `go test ./...` green; end-to-end drill against a
+throwaway `caddy:2-alpine` with a copy of the real file (`:443` edit refused, stale base refused,
+unconfirmed refused, unadaptable buffer refused, `:80` dial edit saved with the inode and CRLF
+preserved and a snapshot written, rejected reload rolled back); then live, where the model's sync,
+the inode-preserving write and the logger restoration were each confirmed against the running Caddy.
+
+## Fork delta: version check with a build suffix (`d621504`)
+
+The dashboard's update notice compares Docker Hub's newest `vX.Y.Z` tag against the running build's
+version stamp. `semverParts` split on `.` and ran `strconv.Atoi` over each component, so a fork
+stamp like `v2.65.1-secfix` parsed as `2.65.0` and the UI advertised an update to the release it
+was already running. The parser now drops a pre-release/build-metadata suffix and keeps the leading
+digits of each component, so a suffixed stamp compares equal to its upstream version while a
+genuinely newer tag still reports. Upstream is unaffected only because it never ships a suffixed
+stamp.
+
 ## What is absent in this fork
 
 - **GitHub Actions — absent on purpose.** `.github/workflows/*` (CI, CodeQL, Claude review, release

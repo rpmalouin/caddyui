@@ -1,11 +1,25 @@
 > **This is Ron Malouin's personal fork of [X4Applegate/caddyui](https://github.com/X4Applegate/caddyui).**
-> Why it exists: Caddy is the reverse proxy on this homelab, and this copy carries a 2026-10-04
-> security review of the upstream checkout plus its remediation — four fixes (2FA gate coverage,
-> write-gating the upstream tester, `Referer`-based redirect validation, session revocation on
-> password change) with regression tests for each. No upstream pull requests are planned.
-> See [FORK.md](FORK.md) for the exact delta, the deliberately excluded files, and what is absent
-> here (notably GitHub Actions — the upstream gates are run by hand). If you want these changes,
-> fork it and support your fork — upstream is the place for upstream issues.
+> Why it exists: Caddy is the reverse proxy on this homelab, and this copy carries local work upstream
+> does not have — no upstream pull requests are planned, so this file describes the fork, not upstream.
+>
+> - **A 2026-10-04 security review of the upstream checkout plus its remediation** — 2FA gate coverage
+>   over `/api/*`, `Referer`-based redirect validation (two of the four original findings were later
+>   fixed upstream and dropped here rather than duplicated).
+> - **Health probes that do not charge an unresolvable name to the site** — this homelab's vhosts are
+>   `.home` names that resolve nowhere the container can ask, so the public check records no verdict for
+>   them and judges the host through the front door by address with the vhost in `Host` and TLS SNI.
+> - **A Caddyfile page with a scoped editor** (`/caddyfile`, admin-only) — the mounted Caddyfile is
+>   otherwise invisible to the app and drifts below the model that owns `srv0`. The page shows the file,
+>   validates it through Caddy's `/adapt`, diffs it against the live config per host, labels every block
+>   by who owns it, and can save — refusing any edit that would move a `:443` route, `automatic_https` or
+>   `apps.tls`, because those are rebuilt from the proxy-host rows.
+> - **A version check that survives a build suffix** — `v2.65.1-secfix` no longer parses as `2.65.0`, so
+>   the dashboard stops offering an update to the release it is already running.
+>
+> See [FORK.md](FORK.md) for the exact delta, the two Caddy gotchas it encodes (`/load` has no
+> `validate_only`, and a `/load` from a Caddyfile wipes the app's own `logging` block), the deliberately
+> excluded files, and what is absent here (notably GitHub Actions — the upstream gates are run by hand).
+> If you want these changes, fork it and support your fork — upstream is the place for upstream issues.
 
 # Caddy UI
 
@@ -58,6 +72,29 @@ run CaddyUI directly in an LXC, VM, or bare-metal host.
 ---
 
 ## Features
+
+### Caddyfile page and scoped editor (fork only, added 2026-10-17)
+
+Admin → **Configuration → Caddyfile** (`/caddyfile`) exposes the file at `CADDYFILE_PATH`, which the
+rest of the app never reads: in `managed` mode the `:443` route set is rebuilt from the proxy-host
+rows, so the Caddyfile only matters at boot or on a by-hand reload — and it drifts quietly in between.
+The page shows the file's line count, bytes, hash and line endings, validates it through Caddy's
+`/adapt` (which runs no configuration), and diffs the adapted result against the live config **per
+host**: host set, upstream dials, basic-auth accounts and `header_up` sets. Each top-level block is
+labelled by its owner — a model row (enabled or deliberately disabled, which a reload would
+resurrect), the `:80` listener the file owns, a snippet, or something the model does not know.
+
+Saving is deliberately narrow. `POST /caddyfile/save` refuses any edit that would move a `:443` route,
+`automatic_https` or `apps.tls` — those belong to the rows and a text edit would be reverted or fought
+over — and accepts the rest (plain-HTTP tunnel blocks, snippets, global options, comments). A save
+checks a sha256 of the file it rendered from, snapshots the current file, writes in place so the inode
+Caddy's bind is pinned to does not move, reloads through the admin API, re-syncs so the rows are the
+last writer, and reinstalls the app's own access/certificate loggers, which a Caddyfile `/load`
+otherwise wipes.
+
+Two deployment requirements follow from that: mount the Caddyfile writable, and make it writable by the
+container's UID (`10001`) — a `root:root 0644` file fails every save. `CADDYUI_CADDYFILE_SNAPSHOT_DIR`
+(default `/data/caddyfile-snapshots`) holds one copy per save.
 
 ### Fleet deployment, certificates, layer4 routing, and hardening in v2.53 – v2.65
 
@@ -556,7 +593,8 @@ edge.
 | `CADDYUI_LISTEN` | `:8080` | Listen address |
 | `CADDYUI_INGEST_LISTEN` | `:9019` | Structured Caddy log ingest for analytics, certificate lifecycle, and temporary runtime streams; set empty to disable all three |
 | `CADDY_ADMIN_URL` | `http://caddy:2019` | Caddy admin API base URL |
-| `CADDYFILE_PATH` | `/etc/caddy/Caddyfile` | Optional — path to a Caddyfile mounted into the CaddyUI container. Its `(name) { ... }` snippet definitions are auto-loaded so `import <name>` works in Advanced routes, Caddyfile paste import, and a proxy host's Advanced config; site blocks and global options in it are never used |
+| `CADDYFILE_PATH` | `/etc/caddy/Caddyfile` | Optional — path to a Caddyfile mounted into the CaddyUI container. Its `(name) { ... }` snippet definitions are auto-loaded so `import <name>` works in Advanced routes, Caddyfile paste import, and a proxy host's Advanced config. In this fork the same file is also shown, diffed and edited at `/caddyfile` (see Features) |
+| `CADDYUI_CADDYFILE_SNAPSHOT_DIR` | `/data/caddyfile-snapshots` | Fork only — directory that receives one timestamped copy of the Caddyfile before every save from `/caddyfile` |
 | `CADDYUI_PUBLIC_URL` | _(empty)_ | Externally visible origin, e.g. `https://caddyui.example.com`. Used for the links in password-reset and invitation emails; without it the link is built from the request's `Host` header. |
 | `CADDYUI_SYNC_ON_START` | *(unset)* | Set to `1` to push DB state to Caddy on startup |
 
